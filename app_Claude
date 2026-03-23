@@ -13,7 +13,7 @@ from src.constants import BENCHMARK_COLUMNS
 from src.data import load_csv
 from src.state import _init, ensure_filter_defaults, filter_defaults, reset_filters
 from src.ui_utils import df_to_records
-from src.views import benchmark, downtime, export, groups, overview, period_compare, quality, runtime
+from src.views import benchmark, downtime, export, groups, overview, period_compare, quality as quality_view, runtime
 
 warnings.filterwarnings("ignore")
 
@@ -57,10 +57,10 @@ if st.session_state.get("_file_key") != file_key:
     st.session_state["_file_key"] = file_key
 
 with st.spinner("Parsing and cleaning data …"):
-    df_full, df_raw, quality = load_csv(st.session_state["_raw_bytes"])
+    df_full, df_raw, quality_info = load_csv(st.session_state["_raw_bytes"])
 
 if df_full is None:
-    st.error(f"❌ Could not parse file: {quality.get('error')}")
+    st.error(f"❌ Could not parse file: {quality_info.get('error')}")
     st.stop()
 
 ensure_filter_defaults(df_full)
@@ -141,7 +141,7 @@ tabs = st.tabs(["📊 Overview", "🧹 Data Quality", "⏱ Runtime", "⏸ Downti
 with tabs[0]:
     overview.render(cached_views["df"], cached_views["out_info"], selected_trim_pct, trim_mean_name)
 with tabs[1]:
-    quality.render(cached_views["df"], cached_views["df_excl"], df_full, cached_views["out_info"], quality)
+    quality_view.render(cached_views["df"], cached_views["df_excl"], df_full, cached_views["out_info"], quality_info)
 with tabs[2]:
     runtime.render(cached_views["df"], cached_views["rt_summary"], selected_trim_pct, trimmed_mean_name)
 with tabs[3]:
