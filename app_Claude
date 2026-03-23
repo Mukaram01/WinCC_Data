@@ -154,25 +154,68 @@ def to_excel(sheets: dict) -> bytes:
     return buf.getvalue()
 
 
-def apply_outliers(df: pd.DataFrame, col: str, mode: str):
+def apply_outliers(
+    df: pd.DataFrame,
+    col: str,
+    mode: str,
+    min_value: float | None = None,
+    max_value: float | None = None,
+    trim_pct: float | None = None,
+):
     """
     Returns (kept_df, excluded_df, info_dict).
-    Modes: 'None' | 'Mild (IQR x3)' | 'Aggressive (IQR×1.5 + P2-P98)'
+    Modes: 'None' | 'Mild (IQR x3)' | 'Aggressive (IQR×1.5 + P2-P98)' | 'Custom bounds'
     """
     if mode == "None" or df[col].dropna().empty:
         return df.copy(), pd.DataFrame(columns=df.columns), {}
+
     vals = df[col].dropna()
     q1, q3 = vals.quantile(0.25), vals.quantile(0.75)
     iqr = q3 - q1
-    if "Mild" in mode:
+    trim_fraction = None if trim_pct is None else float(trim_pct)
+    if trim_fraction is not None and trim_fraction >= 1:
+        trim_fraction = trim_fraction / 100.0
+
+    if mode == "Custom bounds":
+        lo = 0.0 if min_value is None else float(min_value)
+        hi = float("inf") if max_value is None else float(max_value)
+        if hi < lo:
+            lo, hi = hi, lo
+        source = "custom"
+        detail = "Manual min/max inputs"
+    elif "Mild" in mode:
         lo = max(0.0, q1 - 3.0 * iqr)
         hi = q3 + 3.0 * iqr
+        source = "preset"
+        detail = mode
     else:
         lo = max(0.0, max(q1 - 1.5 * iqr, vals.quantile(0.02)))
         hi = min(q3 + 1.5 * iqr, vals.quantile(0.98))
+        source = "preset"
+        detail = mode
+
+    if trim_fraction is not None and trim_fraction > 0:
+        lower_trim = vals.quantile(trim_fraction)
+        upper_trim = vals.quantile(1 - trim_fraction)
+        lo = max(lo, lower_trim)
+        hi = min(hi, upper_trim)
+
     mask = df[col].between(lo, hi, inclusive="both") | df[col].isna()
-    info = {"lo": lo, "hi": hi, "q1": q1, "q3": q3, "iqr": iqr,
-            "removed": int((~mask).sum()), "kept": int(mask.sum())}
+    info = {
+        "lo": lo,
+        "hi": hi,
+        "q1": q1,
+        "q3": q3,
+        "iqr": iqr,
+        "removed": int((~mask).sum()),
+        "kept": int(mask.sum()),
+        "mode": mode,
+        "source": source,
+        "detail": detail,
+        "trim_pct": trim_fraction,
+        "min_value": min_value,
+        "max_value": max_value,
+    }
     return df[mask].copy(), df[~mask].copy(), info
 
 
@@ -320,7 +363,38 @@ with st.sidebar:
 
     st.subheader("📊 Outlier Removal")
     MODES = ["None", "Mild (IQR x3)", "Aggressive (IQR x1.5 + P2-P98)"]
+    outlier_mode_type = st.radio(
+        "Outlier filter type",
+        ["Preset rules", "Custom bounds"],
+        index=0,
+        horizontal=True,
+    )
     out_mode = st.selectbox("Runtime outlier mode", MODES, index=1)
+
+    custom_trim_pct = None
+    custom_min_runtime = None
+    custom_max_runtime = None
+    if outlier_mode_type == "Custom bounds":
+        custom_trim_pct = st.number_input(
+            "Trim threshold percent",
+            min_value=0.0,
+            max_value=49.0,
+            value=0.0,
+            step=0.5,
+            help="Use either a percentage (10 for 10%) or a decimal fraction (0.10 for 10%).",
+        )
+        custom_min_runtime = st.number_input(
+            "Minimum runtime bound (minutes)",
+            min_value=0.0,
+            value=0.0,
+            step=1.0,
+        )
+        custom_max_runtime = st.number_input(
+            "Maximum runtime bound (minutes)",
+            min_value=0.0,
+            value=float(max(1.0, df_full["RuntimeMinutes"].dropna().max() if not df_full["RuntimeMinutes"].dropna().empty else 1.0)),
+            step=1.0,
+        )
 
     if st.button("🔄 Reset Filters"):
         st.rerun()
@@ -340,7 +414,19 @@ if excl_miss: df = df[df["RuntimeMinutes"].notna()]
 if excl_zero: df = df[df["RuntimeMinutes"] != 0]
 if excl_dup:  df = df[~df["_dup"]]
 
-df, df_excl, out_info = apply_outliers(df, "RuntimeMinutes", out_mode)
+active_outlier_mode = out_mode if outlier_mode_type == "Preset rules" else "Custom bounds"
+active_trim_pct = custom_trim_pct if outlier_mode_type == "Custom bounds" else None
+active_min_runtime = custom_min_runtime if outlier_mode_type == "Custom bounds" else None
+active_max_runtime = custom_max_runtime if outlier_mode_type == "Custom bounds" else None
+
+df, df_excl, out_info = apply_outliers(
+    df,
+    "RuntimeMinutes",
+    active_outlier_mode,
+    min_value=active_min_runtime,
+    max_value=active_max_runtime,
+    trim_pct=active_trim_pct,
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PRE-COMPUTE ALL DERIVED DATA  (must be outside tabs to avoid scoping issues)
@@ -506,9 +592,16 @@ with t_ov:
     kpi(r2[5], "Std Dev Runtime",   fmt(rt.std()) or "—")
 
     if out_info:
+        source_label = "preset rule" if out_info["source"] == "preset" else "manual bounds"
+        trim_text = (
+            f" | Trim: {out_info['trim_pct'] * 100:.1f}%"
+            if out_info.get("trim_pct") is not None and out_info.get("trim_pct") > 0
+            else ""
+        )
         st.info(
-            f"🔎 **Outlier removal** ({out_mode}): **{out_info['removed']}** rows removed  |  "
-            f"Threshold: {fmt(out_info['lo'])} – {fmt(out_info['hi'])}  |  "
+            f"🔎 **Outlier removal** ({out_info['mode']}): **{out_info['removed']}** rows removed | "
+            f"Source: {source_label} ({out_info['detail']}) | "
+            f"Threshold: {fmt(out_info['lo'])} – {fmt(out_info['hi'])}{trim_text} | "
             f"Kept: {out_info['kept']} rows"
         )
 
@@ -591,9 +684,18 @@ with t_qc:
         st.dataframe(sus, use_container_width=True, hide_index=True)
 
     if out_info and not df_excl.empty:
-        st.subheader(f"Excluded Outliers ({out_mode})  — {out_info['removed']} rows")
-        st.info(f"Threshold: {fmt(out_info['lo'])} – {fmt(out_info['hi'])}  "
-                f"| Q1={fmt(out_info['q1'])}  Q3={fmt(out_info['q3'])}  IQR={fmt(out_info['iqr'])}")
+        source_label = "Preset rule" if out_info["source"] == "preset" else "Manual bounds"
+        trim_text = (
+            f" | Trim: {out_info['trim_pct'] * 100:.1f}%"
+            if out_info.get("trim_pct") is not None and out_info.get("trim_pct") > 0
+            else ""
+        )
+        st.subheader(f"Excluded Outliers ({out_info['mode']})  — {out_info['removed']} rows")
+        st.info(
+            f"Source: {source_label} ({out_info['detail']}) | "
+            f"Threshold: {fmt(out_info['lo'])} – {fmt(out_info['hi'])}{trim_text} | "
+            f"Q1={fmt(out_info['q1'])}  Q3={fmt(out_info['q3'])}  IQR={fmt(out_info['iqr'])}"
+        )
         st.dataframe(
             df_excl[DISP_COLS].rename(columns={"Rt_disp": "Runtime"}),
             use_container_width=True, hide_index=True,
