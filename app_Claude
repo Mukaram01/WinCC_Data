@@ -5,9 +5,11 @@ Single-file Streamlit app.  Run:  streamlit run app.py
 """
 
 import io
+import json
 import re
 import warnings
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -331,6 +333,103 @@ BENCHMARK_COLUMNS = [
 ]
 
 
+DATA_DIR = Path(__file__).resolve().parent / "data"
+BENCHMARKS_PATH = DATA_DIR / "benchmarks.csv"
+FAMILIES_PATH = DATA_DIR / "families.json"
+
+
+def _clean_text_value(value):
+    if value is None or pd.isna(value):
+        return pd.NA
+    text = str(value).strip()
+    return text if text else pd.NA
+
+
+def _prepare_benchmark_df(df: pd.DataFrame | None) -> pd.DataFrame:
+    """Normalize benchmark data into the canonical persisted/runtime shape."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=BENCHMARK_COLUMNS)
+
+    prepared = df.copy()
+    for col in BENCHMARK_COLUMNS:
+        if col not in prepared.columns:
+            prepared[col] = pd.NA
+
+    prepared["PartNumber"] = prepared["PartNumber"].astype("string").str.strip()
+    prepared["OperationNumber"] = normalize_operation_number(prepared["OperationNumber"])
+    prepared["Family"] = prepared["Family"].apply(_clean_text_value)
+    prepared["Notes"] = prepared["Notes"].apply(_clean_text_value)
+
+    for col in ["OperatorTime_min", "ProductionTime_min"]:
+        prepared[col] = pd.to_numeric(prepared[col], errors="coerce")
+
+    prepared = prepared.dropna(subset=["PartNumber", "OperationNumber"])
+    prepared = prepared.drop_duplicates(subset=["PartNumber", "OperationNumber"], keep="last")
+    return prepared[BENCHMARK_COLUMNS].reset_index(drop=True)
+
+
+def load_persisted_benchmarks() -> pd.DataFrame:
+    """Load persisted benchmarks into the canonical DataFrame shape."""
+    if not BENCHMARKS_PATH.exists():
+        return pd.DataFrame(columns=BENCHMARK_COLUMNS)
+    try:
+        raw = pd.read_csv(BENCHMARKS_PATH, dtype=str)
+    except Exception as exc:
+        st.warning(f"Could not load persisted benchmarks from {BENCHMARKS_PATH.name}: {exc}")
+        return pd.DataFrame(columns=BENCHMARK_COLUMNS)
+    return _prepare_benchmark_df(raw)
+
+
+def save_benchmarks(df: pd.DataFrame) -> None:
+    """Persist benchmarks locally beside the app deployment."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    persisted = _prepare_benchmark_df(df).copy()
+    for col in ["Family", "Notes"]:
+        persisted[col] = persisted[col].fillna("")
+    persisted.to_csv(BENCHMARKS_PATH, index=False)
+
+
+def load_persisted_families() -> dict[str, list[str]]:
+    """Load persisted family mappings as {family_name: [part_numbers]}."""
+    if not FAMILIES_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(FAMILIES_PATH.read_text())
+    except Exception as exc:
+        st.warning(f"Could not load persisted families from {FAMILIES_PATH.name}: {exc}")
+        return {}
+
+    if not isinstance(raw, dict):
+        st.warning(f"Ignoring invalid families data in {FAMILIES_PATH.name}; expected a JSON object.")
+        return {}
+
+    families: dict[str, list[str]] = {}
+    for family_name, parts in raw.items():
+        clean_name = str(family_name).strip()
+        if not clean_name or not isinstance(parts, list):
+            continue
+        clean_parts = []
+        seen = set()
+        for part in parts:
+            part_text = str(part).strip()
+            if part_text and part_text not in seen:
+                clean_parts.append(part_text)
+                seen.add(part_text)
+        families[clean_name] = clean_parts
+    return families
+
+
+def save_families(families: dict[str, list[str]]) -> None:
+    """Persist family mappings locally beside the app deployment."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    clean_families = {
+        str(name).strip(): sorted({str(part).strip() for part in parts if str(part).strip()})
+        for name, parts in families.items()
+        if str(name).strip()
+    }
+    FAMILIES_PATH.write_text(json.dumps(clean_families, indent=2, sort_keys=True))
+
+
 @st.cache_data(show_spinner=False)
 def load_benchmark_csv(data: bytes) -> tuple[pd.DataFrame | None, str | None]:
     """Parse and validate uploaded benchmark CSV into canonical benchmark columns."""
@@ -402,9 +501,7 @@ def load_benchmark_csv(data: bytes) -> tuple[pd.DataFrame | None, str | None]:
         if col not in df.columns:
             df[col] = pd.NA
 
-    df = df[BENCHMARK_COLUMNS].copy()
-    df = df.drop_duplicates(subset=["PartNumber", "OperationNumber"], keep="last").reset_index(drop=True)
-    return df, None
+    return _prepare_benchmark_df(df), None
 
 
 @st.cache_data(show_spinner=False)
@@ -671,12 +768,13 @@ def build_cached_views(
 
 def _init():
     if "benchmarks" not in st.session_state:
-        st.session_state.benchmarks = pd.DataFrame(columns=[
-            "PartNumber", "OperationNumber", "Family",
-            "OperatorTime_min", "ProductionTime_min", "Notes",
-        ])
+        st.session_state.benchmarks = load_persisted_benchmarks()
+    else:
+        st.session_state.benchmarks = _prepare_benchmark_df(st.session_state.benchmarks)
     if "families" not in st.session_state:
-        st.session_state.families: dict[str, list[str]] = {}
+        st.session_state.families = load_persisted_families()
+    else:
+        st.session_state.families = load_persisted_families() if not isinstance(st.session_state.families, dict) else st.session_state.families
 
 _init()
 
@@ -1175,6 +1273,10 @@ with t_bm:
         "*Operator Time*: manually entered current run data from the operator  |  "
         "*Prod. Time*: proposed target from Production Engineering"
     )
+    st.caption(
+        f"Persistence: benchmark edits are stored locally for this deployment in `{BENCHMARKS_PATH.relative_to(Path(__file__).resolve().parent)}`. "
+        "Anyone using the same app files will see the same saved benchmark rows."
+    )
 
     with st.expander("➕ Add / Edit Benchmark Row", expanded=False):
         be1, be2, be3 = st.columns(3)
@@ -1196,8 +1298,9 @@ with t_bm:
                     "ProductionTime_min": parse_user_time(bm_pr_t),
                     "Notes": bm_notes,
                 }])
-                st.session_state.benchmarks = pd.concat([cur, new_row], ignore_index=True)
-                st.success(f"Saved {bm_part} / Op {bm_op}. Refresh the page to update charts.")
+                st.session_state.benchmarks = _prepare_benchmark_df(pd.concat([cur, new_row], ignore_index=True))
+                save_benchmarks(st.session_state.benchmarks)
+                st.success(f"Saved {bm_part} / Op {bm_op}. Changes are stored locally in {BENCHMARKS_PATH.name}.")
             else:
                 st.warning("Select Part and Operation first.")
 
@@ -1209,7 +1312,8 @@ with t_bm:
                 st.error(benchmark_error)
             else:
                 st.session_state.benchmarks = benchmark_df
-                st.success("Loaded successfully.")
+                save_benchmarks(st.session_state.benchmarks)
+                st.success(f"Loaded successfully and saved locally to {BENCHMARKS_PATH.name}.")
 
     st.subheader("Comparison Table")
     st.caption(f"Benchmark trim statistics reflect the current selection: {trim_pct_label(selected_trim_pct)}.")
@@ -1244,13 +1348,18 @@ with t_bm:
                 st.session_state.benchmarks = bm_cur[
                     ~((bm_cur["PartNumber"] == p) & (bm_cur["OperationNumber"] == o))
                 ].reset_index(drop=True)
-                st.success(f"Deleted {del_lbl}")
+                save_benchmarks(st.session_state.benchmarks)
+                st.success(f"Deleted {del_lbl}. Changes are stored locally in {BENCHMARKS_PATH.name}.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB: GROUPS / FAMILIES
 # ─────────────────────────────────────────────────────────────────────────────
 with t_gr:
     st.subheader("Part Family / Group Analysis")
+    st.caption(
+        f"Persistence: family definitions are stored locally for this deployment in `{FAMILIES_PATH.relative_to(Path(__file__).resolve().parent)}` as JSON. "
+        "Anyone using the same app files will see the same family mappings."
+    )
 
     with st.expander("✏️ Define Part Families", expanded=True):
         g1, g2, g3 = st.columns([2, 4, 2])
@@ -1258,8 +1367,10 @@ with t_gr:
         fam_parts = g2.multiselect("Parts", sorted(df_full["PartNumber"].unique()), key="fam_parts")
         if g3.button("💾 Save Family"):
             if fam_name and fam_parts:
-                st.session_state.families[fam_name] = fam_parts
-                st.success(f"'{fam_name}' saved.")
+                clean_name = fam_name.strip()
+                st.session_state.families[clean_name] = sorted(set(fam_parts))
+                save_families(st.session_state.families)
+                st.success(f"'{clean_name}' saved to {FAMILIES_PATH.name}.")
         if st.session_state.families:
             fam_tbl = pd.DataFrame([
                 {"Family": k, "Parts": ", ".join(v)}
@@ -1271,7 +1382,8 @@ with t_gr:
                                  key="del_f")
             if st.button("🗑 Delete Family") and del_f:
                 del st.session_state.families[del_f]
-                st.success(f"Deleted '{del_f}'")
+                save_families(st.session_state.families)
+                st.success(f"Deleted '{del_f}' from {FAMILIES_PATH.name}.")
 
     if st.session_state.families:
         p2f = {p: fam for fam, ps in st.session_state.families.items() for p in ps}
