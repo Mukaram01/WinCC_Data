@@ -205,16 +205,38 @@ def kpi(col, label: str, value: str, delta=None):
         st.metric(label, value, delta=delta)
 
 
-def to_excel(sheets: dict) -> bytes:
-    """Build multi-sheet Excel workbook from {name: DataFrame}."""
+def _df_to_records(df: pd.DataFrame) -> tuple[tuple[object, ...], ...]:
+    """Convert a DataFrame to immutable record tuples for cache-friendly transport."""
+    if df is None or df.empty:
+        return tuple()
+    cleaned = df.where(pd.notna(df), None)
+    return tuple(tuple(row) for row in cleaned.itertuples(index=False, name=None))
+
+
+def _records_to_df(columns: list[str], records: tuple[tuple[object, ...], ...]) -> pd.DataFrame:
+    """Rebuild a DataFrame from immutable record tuples."""
+    if not records:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(list(records), columns=columns)
+
+
+@st.cache_data(show_spinner=False)
+def to_excel(sheet_payload: tuple[tuple[str, tuple[str, ...], tuple[tuple[object, ...], ...]], ...]) -> bytes:
+    """Build multi-sheet Excel workbook from immutable sheet payloads."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        for name, frame in sheets.items():
-            if isinstance(frame, pd.DataFrame) and not frame.empty:
-                frame.to_excel(writer, sheet_name=name[:31], index=False)
+        for name, columns, records in sheet_payload:
+            if not records:
+                continue
+            pd.DataFrame(list(records), columns=list(columns)).to_excel(
+                writer,
+                sheet_name=name[:31],
+                index=False,
+            )
     return buf.getvalue()
 
 
+@st.cache_data(show_spinner=False)
 def apply_outliers(
     df: pd.DataFrame,
     col: str,
@@ -309,6 +331,7 @@ BENCHMARK_COLUMNS = [
 ]
 
 
+@st.cache_data(show_spinner=False)
 def load_benchmark_csv(data: bytes) -> tuple[pd.DataFrame | None, str | None]:
     """Parse and validate uploaded benchmark CSV into canonical benchmark columns."""
     try:
@@ -384,6 +407,7 @@ def load_benchmark_csv(data: bytes) -> tuple[pd.DataFrame | None, str | None]:
     return df, None
 
 
+@st.cache_data(show_spinner=False)
 def load_csv(data: bytes):
     """
     Parse WinCC semicolon CSV.
@@ -435,6 +459,210 @@ def load_csv(data: bytes):
         "missing_by_col":  {c: int(df[c].isna().sum()) for c in REQUIRED},
     }
     return df, raw, quality
+
+
+@st.cache_data(show_spinner=False)
+def build_runtime_summary(src: pd.DataFrame, trim_pct: float) -> pd.DataFrame:
+    """Build the runtime summary table for the current filtered dataset."""
+    if src.empty:
+        return pd.DataFrame()
+    g = src.groupby(["PartNumber", "OperationNumber"])
+    base = g["RuntimeMinutes"].agg(
+        Count="count", Median="median", Mean="mean",
+        Std="std", Min="min", Max="max"
+    ).reset_index()
+    tm = g["RuntimeMinutes"].apply(lambda s: trimmed_mean(s, trim_pct)).reset_index(name="TrimMean")
+    p95 = g["RuntimeMinutes"].quantile(0.95).reset_index(name="P95")
+    return base.merge(tm, on=["PartNumber", "OperationNumber"]).merge(
+        p95,
+        on=["PartNumber", "OperationNumber"],
+    )
+
+
+@st.cache_data(show_spinner=False)
+def build_downtime_summary(src: pd.DataFrame) -> pd.DataFrame:
+    """Build the downtime summary table for the current filtered dataset."""
+    if src.empty:
+        return pd.DataFrame()
+    return src.groupby(["PartNumber", "OperationNumber"])["DowntimeMinutes"].agg(
+        Count="count", Median="median", Mean="mean", Max="max"
+    ).reset_index()
+
+
+@st.cache_data(show_spinner=False)
+def build_machine_summary(src: pd.DataFrame) -> pd.DataFrame:
+    """Build machine-level runtime and downtime aggregates."""
+    if src.empty:
+        return pd.DataFrame()
+    return src.groupby("MachineName").agg(
+        Rows=("ID", "count"),
+        MedianRuntime=("RuntimeMinutes", "median"),
+        TotalDowntimeMin=("DowntimeMinutes", "sum"),
+    ).reset_index()
+
+
+@st.cache_data(show_spinner=False)
+def build_benchmark_comparison(
+    src: pd.DataFrame,
+    benchmark_records: tuple[tuple[object, ...], ...],
+    trim_pct: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build raw WinCC aggregates plus benchmark comparison data."""
+    wincc_agg = pd.DataFrame()
+    bm_comparison = pd.DataFrame()
+    if src.empty:
+        return wincc_agg, bm_comparison
+
+    g = src.groupby(["PartNumber", "OperationNumber"])
+    wincc_agg = g["RuntimeMinutes"].agg(
+        WinCC_Count="count", WinCC_Median="median", WinCC_Mean="mean"
+    ).reset_index()
+    tm_s = g["RuntimeMinutes"].apply(lambda s: trimmed_mean(s, trim_pct)).reset_index(name="WinCC_TrimMean")
+    wincc_agg = wincc_agg.merge(tm_s, on=["PartNumber", "OperationNumber"])
+
+    benchmark_df = _records_to_df(BENCHMARK_COLUMNS, benchmark_records)
+    if benchmark_df.empty:
+        bm_comparison = wincc_agg.copy()
+        for c in ["OperatorTime_min", "ProductionTime_min", "Family", "Notes"]:
+            bm_comparison[c] = np.nan
+    else:
+        bm_comparison = wincc_agg.merge(
+            benchmark_df[["PartNumber", "OperationNumber", "Family", "OperatorTime_min", "ProductionTime_min", "Notes"]],
+            on=["PartNumber", "OperationNumber"], how="outer",
+        )
+    return wincc_agg, bm_comparison
+
+
+@st.cache_data(show_spinner=False)
+def build_comparison_display(cmp: pd.DataFrame, trim_label: str) -> pd.DataFrame:
+    """Build the formatted benchmark comparison table."""
+    if cmp.empty:
+        return pd.DataFrame()
+    rows = []
+    for _, r in cmp.iterrows():
+        med = r.get("WinCC_Median")
+        op_t = r.get("OperatorTime_min")
+        pr_t = r.get("ProductionTime_min")
+        row = {
+            "Part": r.get("PartNumber", ""),
+            "Op": r.get("OperationNumber", ""),
+            "Count": int(r["WinCC_Count"]) if pd.notna(r.get("WinCC_Count")) else "",
+            "WinCC Median": fmt(med),
+            "WinCC Mean": fmt(r.get("WinCC_Mean")),
+            trim_label: fmt(r.get("WinCC_TrimMean")),
+            "Operator Time": fmt(op_t),
+            "Prod. Time": fmt(pr_t),
+        }
+        if pd.notna(med) and pd.notna(op_t) and float(op_t) != 0:
+            d = float(med) - float(op_t)
+            row["Δ vs Operator"] = fmt(abs(d)) + (" ↑" if d > 0 else " ↓")
+            row["% vs Operator"] = f"{d / float(op_t) * 100:+.1f}%"
+        else:
+            row["Δ vs Operator"] = "—"
+            row["% vs Operator"] = "—"
+        if pd.notna(med) and pd.notna(pr_t) and float(pr_t) != 0:
+            d2 = float(med) - float(pr_t)
+            row["Δ vs Prod."] = fmt(abs(d2)) + (" ↑" if d2 > 0 else " ↓")
+        else:
+            row["Δ vs Prod."] = "—"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False)
+def build_cached_views(
+    df_full: pd.DataFrame,
+    date_from_iso: str,
+    date_to_iso: str,
+    machines: tuple[str, ...],
+    parts: tuple[str, ...],
+    operations: tuple[str, ...],
+    serial_filter: str,
+    order_filter: str,
+    exclude_missing_runtime: bool,
+    exclude_zero_runtime: bool,
+    exclude_duplicates: bool,
+    outlier_mode: str,
+    outlier_trim_pct: float | None,
+    min_runtime: float | None,
+    max_runtime: float | None,
+    benchmark_records: tuple[tuple[object, ...], ...],
+    trim_pct: float,
+    trim_label: str,
+) -> dict[str, pd.DataFrame | dict]:
+    """Build the cached filtered dataset and its derived report tables."""
+    df = df_full.copy()
+    date_from = pd.to_datetime(date_from_iso).date()
+    date_to = pd.to_datetime(date_to_iso).date()
+    df = df[(df["StartDT"].dt.date >= date_from) & (df["StartDT"].dt.date <= date_to)]
+    if machines:
+        df = df[df["MachineName"].isin(machines)]
+    if parts:
+        df = df[df["PartNumber"].isin(parts)]
+    if operations:
+        df = df[df["OperationNumber"].isin(operations)]
+    if serial_filter:
+        df = df[df["SerialNumber"].str.contains(serial_filter, na=False, case=False)]
+    if order_filter:
+        df = df[df["OrderNumber"].str.contains(order_filter, na=False, case=False)]
+    if exclude_missing_runtime:
+        df = df[df["RuntimeMinutes"].notna()]
+    if exclude_zero_runtime:
+        df = df[df["RuntimeMinutes"] != 0]
+    if exclude_duplicates:
+        df = df[~df["_dup"]]
+
+    df, df_excl, out_info = apply_outliers(
+        df,
+        "RuntimeMinutes",
+        outlier_mode,
+        min_value=min_runtime,
+        max_value=max_runtime,
+        trim_pct=outlier_trim_pct,
+    )
+
+    df_export = df[ECOLS].rename(columns={"Rt_disp": "Runtime_HHMM", "Dt_disp": "Downtime_HHMM"})
+    df_excl_exp = (
+        df_excl[ECOLS].rename(columns={"Rt_disp": "Runtime_HHMM", "Dt_disp": "Downtime_HHMM"})
+        if not df_excl.empty else pd.DataFrame(columns=ECOLS)
+    )
+
+    rt_summary_raw = build_runtime_summary(df, trim_pct)
+    rt_summary = rt_summary_raw.copy()
+    if not rt_summary.empty:
+        for c in ["Median", "Mean", "TrimMean", "Std", "Min", "Max", "P95"]:
+            rt_summary[c] = rt_summary[c].apply(fmt)
+        rt_summary = rt_summary.rename(columns={"TrimMean": trim_label})
+
+    dt_summary_raw = build_downtime_summary(df)
+    dt_summary = dt_summary_raw.copy()
+    if not dt_summary.empty:
+        for c in ["Median", "Mean", "Max"]:
+            dt_summary[c] = dt_summary[c].apply(fmt)
+
+    machine_summary_raw = build_machine_summary(df)
+    mach_summary = machine_summary_raw.copy()
+    if not mach_summary.empty:
+        mach_summary["Median Runtime"] = mach_summary["MedianRuntime"].apply(fmt)
+        mach_summary["Total Downtime"] = mach_summary["TotalDowntimeMin"].apply(fmt)
+        mach_summary = mach_summary.drop(columns=["MedianRuntime", "TotalDowntimeMin"])
+
+    wincc_agg, bm_comparison = build_benchmark_comparison(df, benchmark_records, trim_pct)
+    cmp_display = build_comparison_display(bm_comparison, trim_label)
+
+    return {
+        "df": df,
+        "df_excl": df_excl,
+        "out_info": out_info,
+        "df_export": df_export,
+        "df_excl_exp": df_excl_exp,
+        "rt_summary": rt_summary,
+        "dt_summary": dt_summary,
+        "mach_summary": mach_summary,
+        "wincc_agg": wincc_agg,
+        "bm_comparison": bm_comparison,
+        "cmp_display": cmp_display,
+    }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -564,40 +792,7 @@ with st.sidebar:
         st.rerun()
 
 # ═════════════════════════════════════════════════════════════════════════════
-# APPLY FILTERS
-# ═════════════════════════════════════════════════════════════════════════════
-
-df = df_full.copy()
-df = df[(df["StartDT"].dt.date >= d_from) & (df["StartDT"].dt.date <= d_to)]
-if sel_m: df = df[df["MachineName"].isin(sel_m)]
-if sel_p: df = df[df["PartNumber"].isin(sel_p)]
-if sel_o: df = df[df["OperationNumber"].isin(sel_o)]
-if s_serial: df = df[df["SerialNumber"].str.contains(s_serial, na=False, case=False)]
-if s_order:  df = df[df["OrderNumber"].str.contains(s_order,  na=False, case=False)]
-if excl_miss: df = df[df["RuntimeMinutes"].notna()]
-if excl_zero: df = df[df["RuntimeMinutes"] != 0]
-if excl_dup:  df = df[~df["_dup"]]
-
-active_outlier_mode = out_mode if outlier_mode_type == "Preset rules" else "Custom bounds"
-active_trim_pct = custom_trim_pct if outlier_mode_type == "Custom bounds" else None
-active_min_runtime = custom_min_runtime if outlier_mode_type == "Custom bounds" else None
-active_max_runtime = custom_max_runtime if outlier_mode_type == "Custom bounds" else None
-
-trimmed_mean_name = trimmed_mean_label(selected_trim_pct)
-trim_mean_name = trimmed_mean_label(selected_trim_pct, short=True)
-
-
-df, df_excl, out_info = apply_outliers(
-    df,
-    "RuntimeMinutes",
-    active_outlier_mode,
-    min_value=active_min_runtime,
-    max_value=active_max_runtime,
-    trim_pct=active_trim_pct,
-)
-
-# ═════════════════════════════════════════════════════════════════════════════
-# PRE-COMPUTE ALL DERIVED DATA  (must be outside tabs to avoid scoping issues)
+# APPLY FILTERS + PRECOMPUTE CACHED DERIVED DATA
 # ═════════════════════════════════════════════════════════════════════════════
 
 ECOLS = [
@@ -606,117 +801,48 @@ ECOLS = [
     "Rt_disp", "Dt_disp", "RuntimeMinutes", "DowntimeMinutes",
     "StartDate", "StartTime", "PlannedEndDate", "PlannedEndTime",
 ]
-df_export   = df[ECOLS].rename(columns={"Rt_disp": "Runtime_HHMM", "Dt_disp": "Downtime_HHMM"})
-df_excl_exp = (
-    df_excl[ECOLS].rename(columns={"Rt_disp": "Runtime_HHMM", "Dt_disp": "Downtime_HHMM"})
-    if not df_excl.empty else pd.DataFrame(columns=ECOLS)
+
+active_outlier_mode = out_mode if outlier_mode_type == "Preset rules" else "Custom bounds"
+active_trim_pct = custom_trim_pct if outlier_mode_type == "Custom bounds" else None
+active_min_runtime = custom_min_runtime if outlier_mode_type == "Custom bounds" else None
+active_max_runtime = custom_max_runtime if outlier_mode_type == "Custom bounds" else None
+
+trimmed_mean_name = trimmed_mean_label(selected_trim_pct)
+trim_mean_name = trimmed_mean_label(selected_trim_pct, short=True)
+benchmark_records = _df_to_records(st.session_state.benchmarks[BENCHMARK_COLUMNS].copy())
+
+cached_views = build_cached_views(
+    df_full,
+    d_from.isoformat(),
+    d_to.isoformat(),
+    tuple(sel_m),
+    tuple(sel_p),
+    tuple(sel_o),
+    s_serial,
+    s_order,
+    excl_miss,
+    excl_zero,
+    excl_dup,
+    active_outlier_mode,
+    active_trim_pct,
+    active_min_runtime,
+    active_max_runtime,
+    benchmark_records,
+    selected_trim_pct,
+    trimmed_mean_name,
 )
 
-# Runtime summary
-def _rt_summary(src, trim_pct: float):
-    if src.empty:
-        return pd.DataFrame()
-    g = src.groupby(["PartNumber", "OperationNumber"])
-    base = g["RuntimeMinutes"].agg(
-        Count="count", Median="median", Mean="mean",
-        Std="std", Min="min", Max="max"
-    ).reset_index()
-    tm  = g["RuntimeMinutes"].apply(lambda s: trimmed_mean(s, trim_pct)).reset_index()
-    tm.columns  = ["PartNumber", "OperationNumber", "TrimMean"]
-    p95 = g["RuntimeMinutes"].quantile(0.95).reset_index()
-    p95.columns = ["PartNumber", "OperationNumber", "P95"]
-    out = base.merge(tm, on=["PartNumber", "OperationNumber"])
-    out = out.merge(p95, on=["PartNumber", "OperationNumber"])
-    for c in ["Median", "Mean", "TrimMean", "Std", "Min", "Max", "P95"]:
-        out[c] = out[c].apply(fmt)
-    return out.rename(columns={"TrimMean": trimmed_mean_name})
-
-rt_summary = _rt_summary(df, selected_trim_pct)
-
-# Downtime summary
-def _dt_summary(src):
-    if src.empty:
-        return pd.DataFrame()
-    g = src.groupby(["PartNumber", "OperationNumber"])["DowntimeMinutes"]
-    base = g.agg(Count="count", Median="median", Mean="mean", Max="max").reset_index()
-    for c in ["Median", "Mean", "Max"]:
-        base[c] = base[c].apply(fmt)
-    return base
-
-dt_summary = _dt_summary(df)
-
-# Machine summary
-mach_summary = pd.DataFrame()
-if not df.empty:
-    ms = df.groupby("MachineName").agg(
-        Rows=("ID", "count"),
-        MedianRuntime=("RuntimeMinutes", "median"),
-        TotalDowntimeMin=("DowntimeMinutes", "sum"),
-    ).reset_index()
-    ms["Median Runtime"] = ms["MedianRuntime"].apply(fmt)
-    ms["Total Downtime"] = ms["TotalDowntimeMin"].apply(fmt)
-    mach_summary = ms.drop(columns=["MedianRuntime", "TotalDowntimeMin"])
-
-# WinCC aggregates for benchmark tab
-wincc_agg = pd.DataFrame()
-bm_comparison = pd.DataFrame()
-bm = st.session_state.benchmarks.copy()
-
-if not df.empty:
-    g = df.groupby(["PartNumber", "OperationNumber"])
-    wincc_agg = g["RuntimeMinutes"].agg(
-        WinCC_Count="count", WinCC_Median="median", WinCC_Mean="mean"
-    ).reset_index()
-    tm_s = g["RuntimeMinutes"].apply(lambda s: trimmed_mean(s, selected_trim_pct)).reset_index()
-    tm_s.columns = ["PartNumber", "OperationNumber", "WinCC_TrimMean"]
-    wincc_agg = wincc_agg.merge(tm_s, on=["PartNumber", "OperationNumber"])
-
-    if not bm.empty:
-        bm_comparison = wincc_agg.merge(
-            bm[["PartNumber", "OperationNumber", "Family",
-                "OperatorTime_min", "ProductionTime_min", "Notes"]],
-            on=["PartNumber", "OperationNumber"], how="outer",
-        )
-    else:
-        bm_comparison = wincc_agg.copy()
-        for c in ["OperatorTime_min", "ProductionTime_min", "Family", "Notes"]:
-            bm_comparison[c] = np.nan
-
-# Build display comparison table
-def _cmp_display(cmp):
-    if cmp.empty:
-        return pd.DataFrame()
-    rows = []
-    for _, r in cmp.iterrows():
-        med   = r.get("WinCC_Median")
-        op_t  = r.get("OperatorTime_min")
-        pr_t  = r.get("ProductionTime_min")
-        row = {
-            "Part":            r.get("PartNumber", ""),
-            "Op":              r.get("OperationNumber", ""),
-            "Count":           int(r["WinCC_Count"]) if pd.notna(r.get("WinCC_Count")) else "",
-            "WinCC Median":    fmt(med),
-            "WinCC Mean":      fmt(r.get("WinCC_Mean")),
-            trimmed_mean_name: fmt(r.get("WinCC_TrimMean")),
-            "Operator Time":   fmt(op_t),
-            "Prod. Time":      fmt(pr_t),
-        }
-        if pd.notna(med) and pd.notna(op_t) and float(op_t) != 0:
-            d = float(med) - float(op_t)
-            row["Δ vs Operator"] = fmt(abs(d)) + (" ↑" if d > 0 else " ↓")
-            row["% vs Operator"] = f"{d / float(op_t) * 100:+.1f}%"
-        else:
-            row["Δ vs Operator"] = "—"
-            row["% vs Operator"] = "—"
-        if pd.notna(med) and pd.notna(pr_t) and float(pr_t) != 0:
-            d2 = float(med) - float(pr_t)
-            row["Δ vs Prod."] = fmt(abs(d2)) + (" ↑" if d2 > 0 else " ↓")
-        else:
-            row["Δ vs Prod."] = "—"
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-cmp_display = _cmp_display(bm_comparison)
+df = cached_views["df"]
+df_excl = cached_views["df_excl"]
+out_info = cached_views["out_info"]
+df_export = cached_views["df_export"]
+df_excl_exp = cached_views["df_excl_exp"]
+rt_summary = cached_views["rt_summary"]
+dt_summary = cached_views["dt_summary"]
+mach_summary = cached_views["mach_summary"]
+wincc_agg = cached_views["wincc_agg"]
+bm_comparison = cached_views["bm_comparison"]
+cmp_display = cached_views["cmp_display"]
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TABS
@@ -1298,12 +1424,13 @@ with t_ex:
     # ── 3. Benchmark CSV ─────────────────────────────────────────────────────
     st.markdown("#### 3 · Benchmark Table")
     bm_dl = st.session_state.benchmarks.copy()
-    if not bm_dl.empty:
-        bm_dl["OperatorTime_HHMM"]   = bm_dl["OperatorTime_min"].apply(fmt)
-        bm_dl["ProductionTime_HHMM"] = bm_dl["ProductionTime_min"].apply(fmt)
+    bm_export = bm_dl.copy()
+    if not bm_export.empty:
+        bm_export["OperatorTime_HHMM"] = bm_export["OperatorTime_min"].apply(fmt)
+        bm_export["ProductionTime_HHMM"] = bm_export["ProductionTime_min"].apply(fmt)
         st.download_button(
             label="⬇️ benchmarks.csv",
-            data=bm_dl.to_csv(index=False).encode("utf-8"),
+            data=bm_export.to_csv(index=False).encode("utf-8"),
             file_name="benchmarks.csv",
             mime="text/csv",
             key="dl_bm",
@@ -1314,18 +1441,21 @@ with t_ex:
     # ── 4. Full Excel report ─────────────────────────────────────────────────
     st.markdown("#### 4 · Full Management Report (Excel, multi-sheet)")
     st.caption(f"Runtime and benchmark exports use {trimmed_mean_name} based on the current sidebar selection.")
-    with st.spinner("Building Excel workbook …"):
-        xl = {
-            "Filtered Data":        df_export,
-            "Excluded Outliers":    df_excl_exp,
-            "Runtime Summary":      rt_summary,
-            "Downtime Summary":     dt_summary,
-            "Machine Summary":      mach_summary,
-            "Benchmark Comparison": cmp_display,
-        }
-        if not bm_dl.empty:
-            xl["Benchmarks"] = bm_dl
-        xl_bytes = to_excel(xl)
+    excel_sheets = [
+        ("Filtered Data", df_export),
+        ("Excluded Outliers", df_excl_exp),
+        ("Runtime Summary", rt_summary),
+        ("Downtime Summary", dt_summary),
+        ("Machine Summary", mach_summary),
+        ("Benchmark Comparison", cmp_display),
+    ]
+    if not bm_export.empty:
+        excel_sheets.append(("Benchmarks", bm_export))
+    excel_payload = tuple(
+        (name, tuple(frame.columns), _df_to_records(frame))
+        for name, frame in excel_sheets
+    )
+    xl_bytes = to_excel(excel_payload)
 
     st.download_button(
         label="⬇️ management_report.xlsx",
@@ -1334,7 +1464,7 @@ with t_ex:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="dl_xl",
     )
-    sheets_built = [k for k, v in xl.items() if isinstance(v, pd.DataFrame) and not v.empty]
+    sheets_built = [name for name, frame in excel_sheets if not frame.empty]
     st.caption(f"Sheets included: {', '.join(sheets_built)}")
 
     st.divider()
