@@ -291,6 +291,99 @@ REQUIRED = [
 ]
 
 
+def normalize_operation_number(series: pd.Series) -> pd.Series:
+    """Normalize operation numbers to zero-padded four-character strings."""
+    out = series.astype("string").str.strip()
+    out = out.replace({"": pd.NA, "<NA>": pd.NA, "nan": pd.NA, "None": pd.NA})
+    return out.str.zfill(4)
+
+
+BENCHMARK_REQUIRED = ["PartNumber", "OperationNumber"]
+BENCHMARK_OPTIONAL = [
+    "Family", "OperatorTime_min", "ProductionTime_min", "Notes",
+    "OperatorTime_HHMM", "ProductionTime_HHMM",
+]
+BENCHMARK_COLUMNS = [
+    "PartNumber", "OperationNumber", "Family",
+    "OperatorTime_min", "ProductionTime_min", "Notes",
+]
+
+
+def load_benchmark_csv(data: bytes) -> tuple[pd.DataFrame | None, str | None]:
+    """Parse and validate uploaded benchmark CSV into canonical benchmark columns."""
+    try:
+        raw = pd.read_csv(io.BytesIO(data), encoding="utf-8-sig", dtype=str)
+    except Exception as e:
+        return None, f"Could not read benchmark CSV: {e}"
+
+    raw.columns = [c.strip() for c in raw.columns]
+    missing = [c for c in BENCHMARK_REQUIRED if c not in raw.columns]
+    if missing:
+        recognized = ", ".join(BENCHMARK_REQUIRED + BENCHMARK_OPTIONAL)
+        return None, (
+            "Benchmark CSV is missing required columns: "
+            f"{', '.join(missing)}. Recognized columns: {recognized}."
+        )
+
+    df = raw.copy()
+    for c in df.columns:
+        if df[c].dtype == object:
+            df[c] = df[c].str.strip()
+
+    invalid = []
+    for col in BENCHMARK_REQUIRED:
+        if df[col].isna().all() or (df[col] == "").all():
+            invalid.append(f"{col} has no usable values")
+    if invalid:
+        return None, "Benchmark CSV has invalid required data: " + "; ".join(invalid) + "."
+
+    df["PartNumber"] = df["PartNumber"].astype("string").str.strip()
+    df["OperationNumber"] = normalize_operation_number(df["OperationNumber"])
+
+    if df["PartNumber"].isna().any() or df["OperationNumber"].isna().any():
+        bad_rows = sorted(df.index[df["PartNumber"].isna() | df["OperationNumber"].isna()].tolist())
+        preview = ", ".join(str(i + 2) for i in bad_rows[:5])
+        suffix = "..." if len(bad_rows) > 5 else ""
+        return None, (
+            "Benchmark CSV has blank or invalid PartNumber/OperationNumber values "
+            f"in row(s): {preview}{suffix}."
+        )
+
+    hhmm_to_minutes = {
+        "OperatorTime_HHMM": "OperatorTime_min",
+        "ProductionTime_HHMM": "ProductionTime_min",
+    }
+    invalid_time_messages = []
+    for source_col, target_col in hhmm_to_minutes.items():
+        if source_col not in df.columns:
+            continue
+        parsed = df[source_col].apply(parse_user_time)
+        nonblank = df[source_col].notna() & (df[source_col] != "")
+        invalid_rows = df.index[nonblank & parsed.isna()].tolist()
+        if invalid_rows:
+            preview = ", ".join(str(i + 2) for i in invalid_rows[:5])
+            suffix = "..." if len(invalid_rows) > 5 else ""
+            invalid_time_messages.append(f"{source_col} has invalid values in row(s): {preview}{suffix}")
+        df[target_col] = parsed
+
+    if invalid_time_messages:
+        return None, "Benchmark CSV has invalid time values: " + "; ".join(invalid_time_messages) + "."
+
+    for col in ["OperatorTime_min", "ProductionTime_min"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            df[col] = np.nan
+
+    for col in ["Family", "Notes"]:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    df = df[BENCHMARK_COLUMNS].copy()
+    df = df.drop_duplicates(subset=["PartNumber", "OperationNumber"], keep="last").reset_index(drop=True)
+    return df, None
+
+
 def load_csv(data: bytes):
     """
     Parse WinCC semicolon CSV.
@@ -312,7 +405,7 @@ def load_csv(data: bytes):
             df[c] = df[c].str.strip()
 
     df["ID"] = pd.to_numeric(df["ID"], errors="coerce")
-    df["OperationNumber"] = df["OperationNumber"].str.zfill(4)
+    df["OperationNumber"] = normalize_operation_number(df["OperationNumber"])
 
     df["RuntimeMinutes"]  = df["RuntimeHHMM"].apply(parse_hhmm)
     df["DowntimeMinutes"] = df["DowntimeHHMM"].apply(parse_hhmm)
@@ -985,11 +1078,12 @@ with t_bm:
     with st.expander("📤 Upload Benchmark CSV", expanded=False):
         bm_up = st.file_uploader("Benchmark CSV", type="csv", key="bm_upload")
         if bm_up:
-            try:
-                st.session_state.benchmarks = pd.read_csv(bm_up)
+            benchmark_df, benchmark_error = load_benchmark_csv(bm_up.getvalue())
+            if benchmark_error:
+                st.error(benchmark_error)
+            else:
+                st.session_state.benchmarks = benchmark_df
                 st.success("Loaded successfully.")
-            except Exception as e:
-                st.error(str(e))
 
     st.subheader("Comparison Table")
     st.caption(f"Benchmark trim statistics reflect the current selection: {trim_pct_label(selected_trim_pct)}.")
