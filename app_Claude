@@ -86,6 +86,26 @@ def parse_user_time(val) -> float | None:
         return None
 
 
+def operation_choices(values) -> list[str]:
+    """Return stable stringified operation numbers sorted for UI widgets."""
+    cleaned = []
+    for val in values:
+        if pd.isna(val):
+            continue
+        s = str(val).strip()
+        if s == "":
+            continue
+        cleaned.append(s)
+
+    def _sort_key(value: str):
+        try:
+            return (0, int(float(value)), value)
+        except (TypeError, ValueError):
+            return (1, value)
+
+    return sorted(set(cleaned), key=_sort_key)
+
+
 def trimmed_mean(series: pd.Series, pct: float = 0.10) -> float:
     """Symmetric trimmed mean – no scipy needed."""
     s = series.dropna().sort_values().values
@@ -282,7 +302,7 @@ with st.sidebar:
 
     all_m = sorted(df_full["MachineName"].dropna().unique())
     all_p = sorted(df_full["PartNumber"].dropna().unique())
-    all_o = sorted(df_full["OperationNumber"].dropna().unique())
+    all_o = operation_choices(df_full["OperationNumber"])
 
     st.subheader("🏗 Machine / Part / Operation")
     sel_m = st.multiselect("Machine",     all_m, default=all_m)
@@ -762,7 +782,7 @@ with t_bm:
     with st.expander("➕ Add / Edit Benchmark Row", expanded=False):
         be1, be2, be3 = st.columns(3)
         bm_part = be1.selectbox("Part Number", [""] + sorted(df_full["PartNumber"].unique()), key="bm_part")
-        bm_op   = be2.selectbox("Operation",   [""] + sorted(df_full["OperationNumber"].unique()), key="bm_op")
+        bm_op   = be2.selectbox("Operation",   [""] + operation_choices(df_full["OperationNumber"]), key="bm_op")
         bm_fam  = be3.text_input("Family (optional)", key="bm_fam")
         be4, be5, be6 = st.columns(3)
         bm_op_t  = be4.text_input("Operator Time",            placeholder="e.g. 6:31", key="bm_opt")
