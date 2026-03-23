@@ -118,7 +118,16 @@ def trimmed_mean(series: pd.Series, pct: float = 0.10) -> float:
     return float(s[k : n - k].mean())
 
 
-def stats_dict(series: pd.Series) -> dict:
+def trim_pct_label(pct: float) -> str:
+    return f"{pct * 100:g}%"
+
+
+def trimmed_mean_label(pct: float, short: bool = False) -> str:
+    prefix = "Trim Mean" if short else "Trimmed Mean"
+    return f"{prefix} ({trim_pct_label(pct)})"
+
+
+def stats_dict(series: pd.Series, trim_pct: float) -> dict:
     s = series.dropna()
     if s.empty:
         return {}
@@ -126,7 +135,7 @@ def stats_dict(series: pd.Series) -> dict:
     return {
         "Count": int(len(s)),
         "Mean": s.mean(),
-        "Trimmed Mean (10%)": trimmed_mean(s),
+        trimmed_mean_label(trim_pct): trimmed_mean(s, trim_pct),
         "Median": s.median(),
         "Std Dev": s.std(),
         "IQR": q3 - q1,
@@ -362,6 +371,14 @@ with st.sidebar:
     excl_dup  = st.checkbox("Exclude duplicates",      value=False)
 
     st.subheader("📊 Outlier Removal")
+    selected_trim_pct = st.slider(
+        "Trimmed-mean percentage",
+        min_value=0.0,
+        max_value=25.0,
+        value=10.0,
+        step=0.5,
+        help="Controls every trimmed-mean calculation and related label across the dashboard.",
+    ) / 100.0
     MODES = ["None", "Mild (IQR x3)", "Aggressive (IQR x1.5 + P2-P98)"]
     outlier_mode_type = st.radio(
         "Outlier filter type",
@@ -419,6 +436,10 @@ active_trim_pct = custom_trim_pct if outlier_mode_type == "Custom bounds" else N
 active_min_runtime = custom_min_runtime if outlier_mode_type == "Custom bounds" else None
 active_max_runtime = custom_max_runtime if outlier_mode_type == "Custom bounds" else None
 
+trimmed_mean_name = trimmed_mean_label(selected_trim_pct)
+trim_mean_name = trimmed_mean_label(selected_trim_pct, short=True)
+
+
 df, df_excl, out_info = apply_outliers(
     df,
     "RuntimeMinutes",
@@ -445,7 +466,7 @@ df_excl_exp = (
 )
 
 # Runtime summary
-def _rt_summary(src):
+def _rt_summary(src, trim_pct: float):
     if src.empty:
         return pd.DataFrame()
     g = src.groupby(["PartNumber", "OperationNumber"])
@@ -453,7 +474,7 @@ def _rt_summary(src):
         Count="count", Median="median", Mean="mean",
         Std="std", Min="min", Max="max"
     ).reset_index()
-    tm  = g["RuntimeMinutes"].apply(trimmed_mean).reset_index()
+    tm  = g["RuntimeMinutes"].apply(lambda s: trimmed_mean(s, trim_pct)).reset_index()
     tm.columns  = ["PartNumber", "OperationNumber", "TrimMean"]
     p95 = g["RuntimeMinutes"].quantile(0.95).reset_index()
     p95.columns = ["PartNumber", "OperationNumber", "P95"]
@@ -461,9 +482,9 @@ def _rt_summary(src):
     out = out.merge(p95, on=["PartNumber", "OperationNumber"])
     for c in ["Median", "Mean", "TrimMean", "Std", "Min", "Max", "P95"]:
         out[c] = out[c].apply(fmt)
-    return out.rename(columns={"TrimMean": "Trimmed Mean"})
+    return out.rename(columns={"TrimMean": trimmed_mean_name})
 
-rt_summary = _rt_summary(df)
+rt_summary = _rt_summary(df, selected_trim_pct)
 
 # Downtime summary
 def _dt_summary(src):
@@ -499,7 +520,7 @@ if not df.empty:
     wincc_agg = g["RuntimeMinutes"].agg(
         WinCC_Count="count", WinCC_Median="median", WinCC_Mean="mean"
     ).reset_index()
-    tm_s = g["RuntimeMinutes"].apply(trimmed_mean).reset_index()
+    tm_s = g["RuntimeMinutes"].apply(lambda s: trimmed_mean(s, selected_trim_pct)).reset_index()
     tm_s.columns = ["PartNumber", "OperationNumber", "WinCC_TrimMean"]
     wincc_agg = wincc_agg.merge(tm_s, on=["PartNumber", "OperationNumber"])
 
@@ -529,7 +550,7 @@ def _cmp_display(cmp):
             "Count":           int(r["WinCC_Count"]) if pd.notna(r.get("WinCC_Count")) else "",
             "WinCC Median":    fmt(med),
             "WinCC Mean":      fmt(r.get("WinCC_Mean")),
-            "WinCC Trim Mean": fmt(r.get("WinCC_TrimMean")),
+            trimmed_mean_name: fmt(r.get("WinCC_TrimMean")),
             "Operator Time":   fmt(op_t),
             "Prod. Time":      fmt(pr_t),
         }
@@ -585,7 +606,7 @@ with t_ov:
 
     r2 = st.columns(6)
     kpi(r2[0], "Mean Runtime",      fmt(rt.mean()) or "—")
-    kpi(r2[1], "Trim Mean (10%)",   fmt(trimmed_mean(rt)) or "—")
+    kpi(r2[1], trim_mean_name,       fmt(trimmed_mean(rt, selected_trim_pct)) or "—")
     kpi(r2[2], "P95 Runtime",       fmt(rt.quantile(0.95)) if n else "—")
     kpi(r2[3], "Max Runtime",       fmt(rt.max()) or "—")
     kpi(r2[4], "Max Downtime",      fmt(dts.max()) or "—")
@@ -719,7 +740,7 @@ with t_rt:
         st.warning("No runtime data for current filter selection.")
     else:
         st.subheader("Runtime Statistics")
-        sd = stats_dict(rt)
+        sd = stats_dict(rt, selected_trim_pct)
         sc = st.columns(4)
         for i, (k, v) in enumerate(sd.items()):
             kpi(sc[i % 4], k, str(int(v)) if k == "Count" else fmt(v))
@@ -758,13 +779,13 @@ with t_rt:
 
         st.subheader("Ranked Bar")
         stat_sel = st.selectbox("Statistic",
-                                ["Median", "Mean", "Trimmed Mean", "P95", "Max"],
+                                ["Median", "Mean", trimmed_mean_name, "P95", "Max"],
                                 key="rt_stat")
         _fn_map = {
             "Median": lambda x: x.median(),
             "Mean":   lambda x: x.mean(),
             "Max":    lambda x: x.max(),
-            "Trimmed Mean": trimmed_mean,
+            trimmed_mean_name: lambda x: trimmed_mean(x, selected_trim_pct),
             "P95":    lambda x: x.quantile(0.95),
         }
         fn = _fn_map[stat_sel]
@@ -791,6 +812,7 @@ with t_rt:
         st.plotly_chart(fig6, use_container_width=True)
 
         st.subheader("Runtime Summary Table – Part × Operation")
+        st.caption(f"{trimmed_mean_name} uses the current sidebar selection.")
         st.dataframe(rt_summary, use_container_width=True, hide_index=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -876,7 +898,7 @@ with t_bm:
     st.subheader("Benchmark / Routing Time Comparison")
     st.caption(
         "**Source legend** — "
-        "*WinCC Median/Mean/Trim Mean*: calculated from current filtered+cleaned WinCC data  |  "
+        f"*WinCC Median/Mean/{trim_mean_name}*: calculated from current filtered+cleaned WinCC data  |  "
         "*Operator Time*: manually entered current run data from the operator  |  "
         "*Prod. Time*: proposed target from Production Engineering"
     )
@@ -916,6 +938,7 @@ with t_bm:
                 st.error(str(e))
 
     st.subheader("Comparison Table")
+    st.caption(f"Benchmark trim statistics reflect the current selection: {trim_pct_label(selected_trim_pct)}.")
     if cmp_display.empty:
         st.info("No data available. Upload a file and ensure filters return results.")
     else:
@@ -927,7 +950,7 @@ with t_bm:
             cs["Label"] = cs["PartNumber"] + " / Op" + cs["OperationNumber"]
             fig_bm = go.Figure()
             fig_bm.add_trace(go.Bar(name="WinCC Median",    x=cs["Label"], y=cs["WinCC_Median"]/60,    marker_color="#7c3aed"))
-            fig_bm.add_trace(go.Bar(name="WinCC Trim Mean", x=cs["Label"], y=cs["WinCC_TrimMean"]/60,  marker_color="#89b4fa"))
+            fig_bm.add_trace(go.Bar(name=f"WinCC {trim_mean_name}", x=cs["Label"], y=cs["WinCC_TrimMean"]/60,  marker_color="#89b4fa"))
             if cs.get("OperatorTime_min", pd.Series(dtype=float)).notna().any():
                 fig_bm.add_trace(go.Bar(name="Operator Time",       x=cs["Label"], y=cs["OperatorTime_min"]/60,    marker_color="#a6e3a1"))
             if cs.get("ProductionTime_min", pd.Series(dtype=float)).notna().any():
@@ -1049,7 +1072,7 @@ with t_pc:
                 "Unique Parts": d["PartNumber"].nunique(),
                 "Median Runtime":  fmt(r.median()),
                 "Mean Runtime":    fmt(r.mean()),
-                "Trim Mean":       fmt(trimmed_mean(r)),
+                trim_mean_name:     fmt(trimmed_mean(r, selected_trim_pct)),
                 "P95 Runtime":     fmt(r.quantile(0.95)) if len(r) else "—",
                 "Std Dev":         fmt(r.std()),
                 "Median Downtime": fmt(dw.median()),
@@ -1059,7 +1082,8 @@ with t_pc:
         cmp_tbl = pd.DataFrame([
             _row(dfa, f"A  ({pa_f} → {pa_t})"),
             _row(dfb, f"B  ({pb_f} → {pb_t})"),
-        ]).set_index("Period").T
+]).set_index("Period").T
+        st.caption(f"Period comparison trim statistics use {trim_pct_label(selected_trim_pct)} trimming.")
         st.dataframe(cmp_tbl, use_container_width=True)
 
         if not dfa.empty and not dfb.empty:
@@ -1141,6 +1165,7 @@ with t_ex:
 
     # ── 4. Full Excel report ─────────────────────────────────────────────────
     st.markdown("#### 4 · Full Management Report (Excel, multi-sheet)")
+    st.caption(f"Runtime and benchmark exports use {trimmed_mean_name} based on the current sidebar selection.")
     with st.spinner("Building Excel workbook …"):
         xl = {
             "Filtered Data":        df_export,
