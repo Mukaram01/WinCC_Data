@@ -106,6 +106,58 @@ def operation_choices(values) -> list[str]:
     return sorted(set(cleaned), key=_sort_key)
 
 
+
+
+def filter_defaults(df_full: pd.DataFrame) -> dict:
+    """Centralized default values for sidebar filters."""
+    vdts = df_full["StartDT"].dropna()
+    today = datetime.today().date()
+    mn_d = vdts.min().date() if not vdts.empty else today
+    mx_d = vdts.max().date() if not vdts.empty else today
+    return {
+        "filter_from": mn_d,
+        "filter_to": mx_d,
+        "filter_machine": sorted(df_full["MachineName"].dropna().unique()),
+        "filter_part": sorted(df_full["PartNumber"].dropna().unique()),
+        "filter_operation": operation_choices(df_full["OperationNumber"]),
+        "filter_serial": "",
+        "filter_order": "",
+        "filter_exclude_missing_runtime": True,
+        "filter_exclude_zero_runtime": True,
+        "filter_exclude_duplicates": False,
+        "filter_outlier_mode": "Mild (IQR x3)",
+    }
+
+
+def ensure_filter_defaults(df_full: pd.DataFrame):
+    """Populate unset filter session-state entries with valid defaults."""
+    defaults = filter_defaults(df_full)
+    valid_sets = {
+        "filter_machine": set(defaults["filter_machine"]),
+        "filter_part": set(defaults["filter_part"]),
+        "filter_operation": set(defaults["filter_operation"]),
+    }
+    for key, value in defaults.items():
+        current = st.session_state.get(key)
+        if key in valid_sets:
+            if current is None:
+                st.session_state[key] = value
+                continue
+            filtered = [item for item in current if item in valid_sets[key]]
+            st.session_state[key] = filtered if filtered else value
+        elif key in {"filter_from", "filter_to"}:
+            if current is None or current < defaults["filter_from"] or current > defaults["filter_to"]:
+                st.session_state[key] = value
+        elif key not in st.session_state:
+            st.session_state[key] = value
+
+
+def reset_filters(df_full: pd.DataFrame):
+    """Reset sidebar filters back to their centralized defaults."""
+    for key, value in filter_defaults(df_full).items():
+        st.session_state[key] = value
+
+
 def trimmed_mean(series: pd.Series, pct: float = 0.10) -> float:
     """Symmetric trimmed mean – no scipy needed."""
     s = series.dropna().sort_values().values
@@ -341,34 +393,35 @@ if df_full is None:
 # SIDEBAR – FILTERS
 # ═════════════════════════════════════════════════════════════════════════════
 
+ensure_filter_defaults(df_full)
+filter_defaults_map = filter_defaults(df_full)
+
 with st.sidebar:
     st.header("🔧 Filters & Options")
 
-    vdts = df_full["StartDT"].dropna()
-    mn_d = vdts.min().date() if not vdts.empty else datetime.today().date()
-    mx_d = vdts.max().date() if not vdts.empty else datetime.today().date()
+    mn_d = filter_defaults_map["filter_from"]
+    mx_d = filter_defaults_map["filter_to"]
+    all_m = filter_defaults_map["filter_machine"]
+    all_p = filter_defaults_map["filter_part"]
+    all_o = filter_defaults_map["filter_operation"]
 
     st.subheader("📅 Date Range")
-    d_from = st.date_input("From", value=mn_d, min_value=mn_d, max_value=mx_d)
-    d_to   = st.date_input("To",   value=mx_d, min_value=mn_d, max_value=mx_d)
-
-    all_m = sorted(df_full["MachineName"].dropna().unique())
-    all_p = sorted(df_full["PartNumber"].dropna().unique())
-    all_o = operation_choices(df_full["OperationNumber"])
+    d_from = st.date_input("From", value=filter_defaults_map["filter_from"], min_value=mn_d, max_value=mx_d, key="filter_from")
+    d_to   = st.date_input("To",   value=filter_defaults_map["filter_to"], min_value=mn_d, max_value=mx_d, key="filter_to")
 
     st.subheader("🏗 Machine / Part / Operation")
-    sel_m = st.multiselect("Machine",     all_m, default=all_m)
-    sel_p = st.multiselect("Part Number", all_p, default=all_p)
-    sel_o = st.multiselect("Operation",   all_o, default=all_o)
+    sel_m = st.multiselect("Machine",     all_m, default=filter_defaults_map["filter_machine"], key="filter_machine")
+    sel_p = st.multiselect("Part Number", all_p, default=filter_defaults_map["filter_part"], key="filter_part")
+    sel_o = st.multiselect("Operation",   all_o, default=filter_defaults_map["filter_operation"], key="filter_operation")
 
     st.subheader("🔍 Text Search")
-    s_serial = st.text_input("Serial (contains)", "")
-    s_order  = st.text_input("Order (contains)", "")
+    s_serial = st.text_input("Serial (contains)", filter_defaults_map["filter_serial"], key="filter_serial")
+    s_order  = st.text_input("Order (contains)", filter_defaults_map["filter_order"], key="filter_order")
 
     st.subheader("🧹 Cleaning")
-    excl_miss = st.checkbox("Exclude missing runtime", value=True)
-    excl_zero = st.checkbox("Exclude zero runtime",    value=True)
-    excl_dup  = st.checkbox("Exclude duplicates",      value=False)
+    excl_miss = st.checkbox("Exclude missing runtime", value=filter_defaults_map["filter_exclude_missing_runtime"], key="filter_exclude_missing_runtime")
+    excl_zero = st.checkbox("Exclude zero runtime",    value=filter_defaults_map["filter_exclude_zero_runtime"], key="filter_exclude_zero_runtime")
+    excl_dup  = st.checkbox("Exclude duplicates",      value=filter_defaults_map["filter_exclude_duplicates"], key="filter_exclude_duplicates")
 
     st.subheader("📊 Outlier Removal")
     selected_trim_pct = st.slider(
@@ -386,7 +439,7 @@ with st.sidebar:
         index=0,
         horizontal=True,
     )
-    out_mode = st.selectbox("Runtime outlier mode", MODES, index=1)
+    out_mode = st.selectbox("Runtime outlier mode", MODES, index=MODES.index(filter_defaults_map["filter_outlier_mode"]), key="filter_outlier_mode")
 
     custom_trim_pct = None
     custom_min_runtime = None
@@ -414,6 +467,7 @@ with st.sidebar:
         )
 
     if st.button("🔄 Reset Filters"):
+        reset_filters(df_full)
         st.rerun()
 
 # ═════════════════════════════════════════════════════════════════════════════
