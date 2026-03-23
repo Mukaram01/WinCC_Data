@@ -1,0 +1,1049 @@
+"""
+WinCC Production Analytics Dashboard
+=====================================
+Single-file Streamlit app.  Run:  streamlit run app.py
+"""
+
+import io
+import re
+import warnings
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+warnings.filterwarnings("ignore")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE CONFIG  (must be the very first Streamlit call)
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="WinCC Production Analytics",
+    page_icon="🏭",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+    [data-testid="stMetric"] {
+        background: #1e1e2e; border: 1px solid #313244;
+        border-radius: 10px; padding: 12px 16px;
+    }
+    [data-testid="stMetricLabel"] { font-size: 0.78rem; color: #a6adc8; }
+    [data-testid="stMetricValue"] { font-size: 1.4rem; font-weight: 700; color: #cba6f7; }
+    hr { border-color: #313244; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+THEME = "plotly_dark"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# UTILITY FUNCTIONS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def parse_hhmm(val) -> float | None:
+    """'HH:MM' (any H) → total float minutes, or None."""
+    if pd.isna(val):
+        return None
+    m = re.match(r"^(\d+):(\d{2})$", str(val).strip())
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        if mi < 60:
+            return float(h * 60 + mi)
+    return None
+
+
+def fmt(minutes) -> str:
+    """Float minutes → 'HH:MM'. Empty string for NaN/None."""
+    if minutes is None or (isinstance(minutes, float) and np.isnan(minutes)):
+        return ""
+    v = int(round(float(minutes)))
+    return f"{v // 60:02d}:{v % 60:02d}"
+
+
+def parse_user_time(val) -> float | None:
+    """Parse user-entered time (6:31 / 6h31m / 6.5 / 391) → minutes."""
+    if not val or str(val).strip() == "":
+        return None
+    s = str(val).strip()
+    m = re.match(r"^(\d+):(\d{2})$", s)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    m = re.match(r"^(\d+)\s*h\s*(\d+)\s*m?$", s, re.I)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    try:
+        f = float(s)
+        return f if f > 24 else f * 60
+    except ValueError:
+        return None
+
+
+def trimmed_mean(series: pd.Series, pct: float = 0.10) -> float:
+    """Symmetric trimmed mean – no scipy needed."""
+    s = series.dropna().sort_values().values
+    n = len(s)
+    if n == 0:
+        return np.nan
+    k = int(np.floor(n * pct))
+    if k * 2 >= n:
+        return float(np.median(s))
+    return float(s[k : n - k].mean())
+
+
+def stats_dict(series: pd.Series) -> dict:
+    s = series.dropna()
+    if s.empty:
+        return {}
+    q1, q3 = s.quantile(0.25), s.quantile(0.75)
+    return {
+        "Count": int(len(s)),
+        "Mean": s.mean(),
+        "Trimmed Mean (10%)": trimmed_mean(s),
+        "Median": s.median(),
+        "Std Dev": s.std(),
+        "IQR": q3 - q1,
+        "Min": s.min(),
+        "P5": s.quantile(0.05),
+        "P25": q1,
+        "P75": q3,
+        "P95": s.quantile(0.95),
+        "Max": s.max(),
+    }
+
+
+def kpi(col, label: str, value: str, delta=None):
+    with col:
+        st.metric(label, value, delta=delta)
+
+
+def to_excel(sheets: dict) -> bytes:
+    """Build multi-sheet Excel workbook from {name: DataFrame}."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for name, frame in sheets.items():
+            if isinstance(frame, pd.DataFrame) and not frame.empty:
+                frame.to_excel(writer, sheet_name=name[:31], index=False)
+    return buf.getvalue()
+
+
+def apply_outliers(df: pd.DataFrame, col: str, mode: str):
+    """
+    Returns (kept_df, excluded_df, info_dict).
+    Modes: 'None' | 'Mild (IQR x3)' | 'Aggressive (IQR×1.5 + P2-P98)'
+    """
+    if mode == "None" or df[col].dropna().empty:
+        return df.copy(), pd.DataFrame(columns=df.columns), {}
+    vals = df[col].dropna()
+    q1, q3 = vals.quantile(0.25), vals.quantile(0.75)
+    iqr = q3 - q1
+    if "Mild" in mode:
+        lo = max(0.0, q1 - 3.0 * iqr)
+        hi = q3 + 3.0 * iqr
+    else:
+        lo = max(0.0, max(q1 - 1.5 * iqr, vals.quantile(0.02)))
+        hi = min(q3 + 1.5 * iqr, vals.quantile(0.98))
+    mask = df[col].between(lo, hi, inclusive="both") | df[col].isna()
+    info = {"lo": lo, "hi": hi, "q1": q1, "q3": q3, "iqr": iqr,
+            "removed": int((~mask).sum()), "kept": int(mask.sum())}
+    return df[mask].copy(), df[~mask].copy(), info
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DATA LOADING & CLEANING
+# ═════════════════════════════════════════════════════════════════════════════
+
+REQUIRED = [
+    "ID", "MachineName", "OrderNumber", "SerialNumber",
+    "OperationNumber", "PartNumber", "RuntimeHHMM", "DowntimeHHMM",
+    "StartDate", "StartTime", "PlannedEndDate", "PlannedEndTime",
+]
+
+
+def load_csv(data: bytes):
+    """
+    Parse WinCC semicolon CSV.
+    Returns (df_clean, df_raw, quality_dict) or (None, None, {"error": msg}).
+    """
+    try:
+        raw = pd.read_csv(io.BytesIO(data), sep=";", encoding="utf-8-sig", dtype=str)
+    except Exception as e:
+        return None, None, {"error": str(e)}
+
+    raw.columns = [c.strip() for c in raw.columns]
+    missing = [c for c in REQUIRED if c not in raw.columns]
+    if missing:
+        return None, None, {"error": f"Missing columns: {missing}"}
+
+    df = raw.copy()
+    for c in df.columns:
+        if df[c].dtype == object:
+            df[c] = df[c].str.strip()
+
+    df["ID"] = pd.to_numeric(df["ID"], errors="coerce")
+    df["OperationNumber"] = df["OperationNumber"].str.zfill(4)
+
+    df["RuntimeMinutes"]  = df["RuntimeHHMM"].apply(parse_hhmm)
+    df["DowntimeMinutes"] = df["DowntimeHHMM"].apply(parse_hhmm)
+    df["RuntimeHours"]    = df["RuntimeMinutes"] / 60
+    df["DowntimeHours"]   = df["DowntimeMinutes"] / 60
+    df["Rt_disp"]  = df["RuntimeMinutes"].apply(fmt)
+    df["Dt_disp"]  = df["DowntimeMinutes"].apply(fmt)
+
+    def _dt(dcol, tcol):
+        return pd.to_datetime(df[dcol] + " " + df[tcol],
+                              format="%d/%m/%Y %H:%M", errors="coerce")
+
+    df["StartDT"]   = _dt("StartDate", "StartTime")
+    df["PlannedDT"] = _dt("PlannedEndDate", "PlannedEndTime")
+
+    dup_cols = ["MachineName", "OrderNumber", "SerialNumber",
+                "OperationNumber", "PartNumber", "StartDate", "StartTime"]
+    df["_dup"] = df.duplicated(subset=dup_cols, keep=False)
+
+    quality = {
+        "total":           len(df),
+        "dup":             int(df["_dup"].sum()),
+        "bad_rt":          int(df["RuntimeMinutes"].isna().sum()),
+        "zero_rt":         int((df["RuntimeMinutes"] == 0).sum()),
+        "bad_dt":          int(df["DowntimeMinutes"].isna().sum()),
+        "bad_start":       int(df["StartDT"].isna().sum()),
+        "missing_by_col":  {c: int(df[c].isna().sum()) for c in REQUIRED},
+    }
+    return df, raw, quality
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SESSION STATE INITIALISATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _init():
+    if "benchmarks" not in st.session_state:
+        st.session_state.benchmarks = pd.DataFrame(columns=[
+            "PartNumber", "OperationNumber", "Family",
+            "OperatorTime_min", "ProductionTime_min", "Notes",
+        ])
+    if "families" not in st.session_state:
+        st.session_state.families: dict[str, list[str]] = {}
+
+_init()
+
+# ═════════════════════════════════════════════════════════════════════════════
+# HEADER + UPLOAD
+# ═════════════════════════════════════════════════════════════════════════════
+
+st.title("🏭 WinCC Production Analytics Dashboard")
+
+uploaded = st.file_uploader(
+    "Upload WinCC CSV export (semicolon-delimited, European dates DD/MM/YYYY)",
+    type=["csv", "txt"],
+)
+
+if uploaded is None:
+    st.info("👆 Upload a WinCC CSV file to begin.")
+    st.stop()
+
+# Key upload on (name + size) so re-uploading a new file always re-parses
+file_key = f"{uploaded.name}_{uploaded.size}"
+if st.session_state.get("_file_key") != file_key:
+    st.session_state["_raw_bytes"] = uploaded.read()
+    st.session_state["_file_key"] = file_key
+
+file_bytes = st.session_state["_raw_bytes"]
+
+with st.spinner("Parsing and cleaning data …"):
+    df_full, df_raw, quality = load_csv(file_bytes)
+
+if df_full is None:
+    st.error(f"❌ Could not parse file: {quality.get('error')}")
+    st.stop()
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SIDEBAR – FILTERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+with st.sidebar:
+    st.header("🔧 Filters & Options")
+
+    vdts = df_full["StartDT"].dropna()
+    mn_d = vdts.min().date() if not vdts.empty else datetime.today().date()
+    mx_d = vdts.max().date() if not vdts.empty else datetime.today().date()
+
+    st.subheader("📅 Date Range")
+    d_from = st.date_input("From", value=mn_d, min_value=mn_d, max_value=mx_d)
+    d_to   = st.date_input("To",   value=mx_d, min_value=mn_d, max_value=mx_d)
+
+    all_m = sorted(df_full["MachineName"].dropna().unique())
+    all_p = sorted(df_full["PartNumber"].dropna().unique())
+    all_o = sorted(df_full["OperationNumber"].dropna().unique())
+
+    st.subheader("🏗 Machine / Part / Operation")
+    sel_m = st.multiselect("Machine",     all_m, default=all_m)
+    sel_p = st.multiselect("Part Number", all_p, default=all_p)
+    sel_o = st.multiselect("Operation",   all_o, default=all_o)
+
+    st.subheader("🔍 Text Search")
+    s_serial = st.text_input("Serial (contains)", "")
+    s_order  = st.text_input("Order (contains)", "")
+
+    st.subheader("🧹 Cleaning")
+    excl_miss = st.checkbox("Exclude missing runtime", value=True)
+    excl_zero = st.checkbox("Exclude zero runtime",    value=True)
+    excl_dup  = st.checkbox("Exclude duplicates",      value=False)
+
+    st.subheader("📊 Outlier Removal")
+    MODES = ["None", "Mild (IQR x3)", "Aggressive (IQR x1.5 + P2-P98)"]
+    out_mode = st.selectbox("Runtime outlier mode", MODES, index=1)
+
+    if st.button("🔄 Reset Filters"):
+        st.rerun()
+
+# ═════════════════════════════════════════════════════════════════════════════
+# APPLY FILTERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+df = df_full.copy()
+df = df[(df["StartDT"].dt.date >= d_from) & (df["StartDT"].dt.date <= d_to)]
+if sel_m: df = df[df["MachineName"].isin(sel_m)]
+if sel_p: df = df[df["PartNumber"].isin(sel_p)]
+if sel_o: df = df[df["OperationNumber"].isin(sel_o)]
+if s_serial: df = df[df["SerialNumber"].str.contains(s_serial, na=False, case=False)]
+if s_order:  df = df[df["OrderNumber"].str.contains(s_order,  na=False, case=False)]
+if excl_miss: df = df[df["RuntimeMinutes"].notna()]
+if excl_zero: df = df[df["RuntimeMinutes"] != 0]
+if excl_dup:  df = df[~df["_dup"]]
+
+df, df_excl, out_info = apply_outliers(df, "RuntimeMinutes", out_mode)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PRE-COMPUTE ALL DERIVED DATA  (must be outside tabs to avoid scoping issues)
+# ═════════════════════════════════════════════════════════════════════════════
+
+ECOLS = [
+    "ID", "MachineName", "OrderNumber", "SerialNumber",
+    "OperationNumber", "PartNumber",
+    "Rt_disp", "Dt_disp", "RuntimeMinutes", "DowntimeMinutes",
+    "StartDate", "StartTime", "PlannedEndDate", "PlannedEndTime",
+]
+df_export   = df[ECOLS].rename(columns={"Rt_disp": "Runtime_HHMM", "Dt_disp": "Downtime_HHMM"})
+df_excl_exp = (
+    df_excl[ECOLS].rename(columns={"Rt_disp": "Runtime_HHMM", "Dt_disp": "Downtime_HHMM"})
+    if not df_excl.empty else pd.DataFrame(columns=ECOLS)
+)
+
+# Runtime summary
+def _rt_summary(src):
+    if src.empty:
+        return pd.DataFrame()
+    g = src.groupby(["PartNumber", "OperationNumber"])
+    base = g["RuntimeMinutes"].agg(
+        Count="count", Median="median", Mean="mean",
+        Std="std", Min="min", Max="max"
+    ).reset_index()
+    tm  = g["RuntimeMinutes"].apply(trimmed_mean).reset_index()
+    tm.columns  = ["PartNumber", "OperationNumber", "TrimMean"]
+    p95 = g["RuntimeMinutes"].quantile(0.95).reset_index()
+    p95.columns = ["PartNumber", "OperationNumber", "P95"]
+    out = base.merge(tm, on=["PartNumber", "OperationNumber"])
+    out = out.merge(p95, on=["PartNumber", "OperationNumber"])
+    for c in ["Median", "Mean", "TrimMean", "Std", "Min", "Max", "P95"]:
+        out[c] = out[c].apply(fmt)
+    return out.rename(columns={"TrimMean": "Trimmed Mean"})
+
+rt_summary = _rt_summary(df)
+
+# Downtime summary
+def _dt_summary(src):
+    if src.empty:
+        return pd.DataFrame()
+    g = src.groupby(["PartNumber", "OperationNumber"])["DowntimeMinutes"]
+    base = g.agg(Count="count", Median="median", Mean="mean", Max="max").reset_index()
+    for c in ["Median", "Mean", "Max"]:
+        base[c] = base[c].apply(fmt)
+    return base
+
+dt_summary = _dt_summary(df)
+
+# Machine summary
+mach_summary = pd.DataFrame()
+if not df.empty:
+    ms = df.groupby("MachineName").agg(
+        Rows=("ID", "count"),
+        MedianRuntime=("RuntimeMinutes", "median"),
+        TotalDowntimeMin=("DowntimeMinutes", "sum"),
+    ).reset_index()
+    ms["Median Runtime"] = ms["MedianRuntime"].apply(fmt)
+    ms["Total Downtime"] = ms["TotalDowntimeMin"].apply(fmt)
+    mach_summary = ms.drop(columns=["MedianRuntime", "TotalDowntimeMin"])
+
+# WinCC aggregates for benchmark tab
+wincc_agg = pd.DataFrame()
+bm_comparison = pd.DataFrame()
+bm = st.session_state.benchmarks.copy()
+
+if not df.empty:
+    g = df.groupby(["PartNumber", "OperationNumber"])
+    wincc_agg = g["RuntimeMinutes"].agg(
+        WinCC_Count="count", WinCC_Median="median", WinCC_Mean="mean"
+    ).reset_index()
+    tm_s = g["RuntimeMinutes"].apply(trimmed_mean).reset_index()
+    tm_s.columns = ["PartNumber", "OperationNumber", "WinCC_TrimMean"]
+    wincc_agg = wincc_agg.merge(tm_s, on=["PartNumber", "OperationNumber"])
+
+    if not bm.empty:
+        bm_comparison = wincc_agg.merge(
+            bm[["PartNumber", "OperationNumber", "Family",
+                "OperatorTime_min", "ProductionTime_min", "Notes"]],
+            on=["PartNumber", "OperationNumber"], how="outer",
+        )
+    else:
+        bm_comparison = wincc_agg.copy()
+        for c in ["OperatorTime_min", "ProductionTime_min", "Family", "Notes"]:
+            bm_comparison[c] = np.nan
+
+# Build display comparison table
+def _cmp_display(cmp):
+    if cmp.empty:
+        return pd.DataFrame()
+    rows = []
+    for _, r in cmp.iterrows():
+        med   = r.get("WinCC_Median")
+        op_t  = r.get("OperatorTime_min")
+        pr_t  = r.get("ProductionTime_min")
+        row = {
+            "Part":            r.get("PartNumber", ""),
+            "Op":              r.get("OperationNumber", ""),
+            "Count":           int(r["WinCC_Count"]) if pd.notna(r.get("WinCC_Count")) else "",
+            "WinCC Median":    fmt(med),
+            "WinCC Mean":      fmt(r.get("WinCC_Mean")),
+            "WinCC Trim Mean": fmt(r.get("WinCC_TrimMean")),
+            "Operator Time":   fmt(op_t),
+            "Prod. Time":      fmt(pr_t),
+        }
+        if pd.notna(med) and pd.notna(op_t) and float(op_t) != 0:
+            d = float(med) - float(op_t)
+            row["Δ vs Operator"] = fmt(abs(d)) + (" ↑" if d > 0 else " ↓")
+            row["% vs Operator"] = f"{d / float(op_t) * 100:+.1f}%"
+        else:
+            row["Δ vs Operator"] = "—"
+            row["% vs Operator"] = "—"
+        if pd.notna(med) and pd.notna(pr_t) and float(pr_t) != 0:
+            d2 = float(med) - float(pr_t)
+            row["Δ vs Prod."] = fmt(abs(d2)) + (" ↑" if d2 > 0 else " ↓")
+        else:
+            row["Δ vs Prod."] = "—"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+cmp_display = _cmp_display(bm_comparison)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TABS
+# ═════════════════════════════════════════════════════════════════════════════
+
+DISP_COLS = [
+    "ID", "MachineName", "PartNumber", "OperationNumber",
+    "SerialNumber", "Rt_disp", "StartDate", "StartTime",
+]
+
+tabs = st.tabs([
+    "📊 Overview", "🧹 Data Quality", "⏱ Runtime",
+    "⏸ Downtime", "🎯 Benchmark", "👨‍👩‍👧 Groups",
+    "📅 Period Compare", "💾 Export",
+])
+t_ov, t_qc, t_rt, t_dt, t_bm, t_gr, t_pc, t_ex = tabs
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB: OVERVIEW
+# ─────────────────────────────────────────────────────────────────────────────
+with t_ov:
+    n  = len(df)
+    rt = df["RuntimeMinutes"]
+    dts = df["DowntimeMinutes"]
+
+    st.subheader("Key Performance Indicators")
+    r1 = st.columns(6)
+    kpi(r1[0], "Rows (filtered)",  f"{n:,}")
+    kpi(r1[1], "Unique Parts",      f"{df['PartNumber'].nunique()}")
+    kpi(r1[2], "Unique Serials",    f"{df['SerialNumber'].nunique()}")
+    kpi(r1[3], "Unique Machines",   f"{df['MachineName'].nunique()}")
+    kpi(r1[4], "Median Runtime",    fmt(rt.median()) or "—")
+    kpi(r1[5], "Median Downtime",   fmt(dts.median()) or "—")
+
+    r2 = st.columns(6)
+    kpi(r2[0], "Mean Runtime",      fmt(rt.mean()) or "—")
+    kpi(r2[1], "Trim Mean (10%)",   fmt(trimmed_mean(rt)) or "—")
+    kpi(r2[2], "P95 Runtime",       fmt(rt.quantile(0.95)) if n else "—")
+    kpi(r2[3], "Max Runtime",       fmt(rt.max()) or "—")
+    kpi(r2[4], "Max Downtime",      fmt(dts.max()) or "—")
+    kpi(r2[5], "Std Dev Runtime",   fmt(rt.std()) or "—")
+
+    if out_info:
+        st.info(
+            f"🔎 **Outlier removal** ({out_mode}): **{out_info['removed']}** rows removed  |  "
+            f"Threshold: {fmt(out_info['lo'])} – {fmt(out_info['hi'])}  |  "
+            f"Kept: {out_info['kept']} rows"
+        )
+
+    st.divider()
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Runtime Distribution")
+        if not rt.dropna().empty:
+            fig = px.histogram(df, x="RuntimeHours", nbins=40,
+                               color_discrete_sequence=["#7c3aed"],
+                               labels={"RuntimeHours": "Runtime (h)"},
+                               template=THEME)
+            fig.update_layout(height=300, margin=dict(t=5, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        st.subheader("Median Runtime – Part × Operation")
+        if not df.empty:
+            tmp = df.groupby(["PartNumber", "OperationNumber"])["RuntimeHours"].median().reset_index()
+            tmp["Label"] = tmp["PartNumber"] + " / Op" + tmp["OperationNumber"]
+            fig2 = px.bar(tmp.sort_values("RuntimeHours"),
+                          x="RuntimeHours", y="Label", orientation="h",
+                          color="RuntimeHours", color_continuous_scale="Purples",
+                          labels={"RuntimeHours": "Median (h)", "Label": ""},
+                          template=THEME)
+            fig2.update_layout(height=300, margin=dict(t=5, b=10), showlegend=False)
+            st.plotly_chart(fig2, use_container_width=True)
+
+    st.subheader("Runtime over Time")
+    if not df.dropna(subset=["StartDT"]).empty:
+        fig3 = px.scatter(df.dropna(subset=["StartDT"]),
+                          x="StartDT", y="RuntimeHours", color="PartNumber",
+                          hover_data=["MachineName", "SerialNumber", "OperationNumber"],
+                          labels={"RuntimeHours": "Runtime (h)", "StartDT": "Start"},
+                          template=THEME, height=340)
+        fig3.update_layout(margin=dict(t=5, b=10))
+        st.plotly_chart(fig3, use_container_width=True)
+
+    st.subheader("Top 10 Longest Runtime Events")
+    if not df.empty:
+        st.dataframe(
+            df.nlargest(10, "RuntimeMinutes")[DISP_COLS]
+              .rename(columns={"Rt_disp": "Runtime"}),
+            use_container_width=True, hide_index=True,
+        )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB: DATA QUALITY
+# ─────────────────────────────────────────────────────────────────────────────
+with t_qc:
+    st.subheader("Data Quality Report  (full dataset, pre-filter)")
+    q = quality
+    c1, c2, c3, c4 = st.columns(4)
+    kpi(c1, "Total Rows",         f"{q['total']:,}")
+    kpi(c2, "Invalid Runtime",    f"{q['bad_rt']:,}")
+    kpi(c3, "Zero Runtime",       f"{q['zero_rt']:,}")
+    kpi(c4, "Duplicate Rows",     f"{q['dup']:,}")
+    c5, c6, c7, c8 = st.columns(4)
+    kpi(c5, "Invalid Start DT",   f"{q['bad_start']:,}")
+    kpi(c6, "Invalid Downtime",   f"{q['bad_dt']:,}")
+    kpi(c7, "Rows after filters", f"{len(df):,}")
+    kpi(c8, "Outliers removed",   f"{out_info.get('removed', 0):,}")
+
+    mv = pd.DataFrame({"Column": list(q["missing_by_col"].keys()),
+                       "Missing": list(q["missing_by_col"].values())})
+    fig_mv = px.bar(mv, x="Column", y="Missing",
+                    color="Missing", color_continuous_scale="Reds",
+                    template=THEME, height=260)
+    fig_mv.update_layout(margin=dict(t=5, b=5))
+    st.plotly_chart(fig_mv, use_container_width=True)
+
+    sus = df_full[df_full["RuntimeMinutes"] > 24 * 60][
+        ["ID", "MachineName", "PartNumber", "OperationNumber",
+         "SerialNumber", "Rt_disp", "StartDate"]
+    ].rename(columns={"Rt_disp": "Runtime"})
+    if sus.empty:
+        st.success("✅ No runtimes > 24 h detected.")
+    else:
+        st.warning(f"⚠️  {len(sus)} row(s) with runtime > 24 h — review before analysis.")
+        st.dataframe(sus, use_container_width=True, hide_index=True)
+
+    if out_info and not df_excl.empty:
+        st.subheader(f"Excluded Outliers ({out_mode})  — {out_info['removed']} rows")
+        st.info(f"Threshold: {fmt(out_info['lo'])} – {fmt(out_info['hi'])}  "
+                f"| Q1={fmt(out_info['q1'])}  Q3={fmt(out_info['q3'])}  IQR={fmt(out_info['iqr'])}")
+        st.dataframe(
+            df_excl[DISP_COLS].rename(columns={"Rt_disp": "Runtime"}),
+            use_container_width=True, hide_index=True,
+        )
+
+    st.subheader("Cleaned Data Preview  (filtered)")
+    st.dataframe(
+        df[["ID", "MachineName", "OrderNumber", "SerialNumber",
+            "OperationNumber", "PartNumber", "Rt_disp", "Dt_disp",
+            "StartDate", "StartTime"]]
+          .rename(columns={"Rt_disp": "Runtime", "Dt_disp": "Downtime"}),
+        use_container_width=True, hide_index=True,
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB: RUNTIME ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+with t_rt:
+    rt = df["RuntimeMinutes"]
+    if rt.dropna().empty:
+        st.warning("No runtime data for current filter selection.")
+    else:
+        st.subheader("Runtime Statistics")
+        sd = stats_dict(rt)
+        sc = st.columns(4)
+        for i, (k, v) in enumerate(sd.items()):
+            kpi(sc[i % 4], k, str(int(v)) if k == "Count" else fmt(v))
+
+        st.divider()
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Histogram")
+            fig = px.histogram(df, x="RuntimeHours", nbins=50,
+                               color_discrete_sequence=["#7c3aed"],
+                               labels={"RuntimeHours": "Runtime (h)"},
+                               template=THEME)
+            fig.update_layout(height=300, margin=dict(t=5, b=5))
+            st.plotly_chart(fig, use_container_width=True)
+        with c2:
+            st.subheader("Box Plot by Part")
+            fig2 = px.box(df, x="PartNumber", y="RuntimeHours",
+                          color="PartNumber", template=THEME)
+            fig2.update_layout(height=300, margin=dict(t=5, b=5), showlegend=False)
+            fig2.update_xaxes(tickangle=-40)
+            st.plotly_chart(fig2, use_container_width=True)
+
+        c3, c4 = st.columns(2)
+        with c3:
+            st.subheader("Box Plot by Operation")
+            fig3 = px.box(df, x="OperationNumber", y="RuntimeHours",
+                          color="OperationNumber", template=THEME)
+            fig3.update_layout(height=300, margin=dict(t=5, b=5), showlegend=False)
+            st.plotly_chart(fig3, use_container_width=True)
+        with c4:
+            st.subheader("Box Plot by Machine")
+            fig4 = px.box(df, x="MachineName", y="RuntimeHours",
+                          color="MachineName", template=THEME)
+            fig4.update_layout(height=300, margin=dict(t=5, b=5), showlegend=False)
+            st.plotly_chart(fig4, use_container_width=True)
+
+        st.subheader("Ranked Bar")
+        stat_sel = st.selectbox("Statistic",
+                                ["Median", "Mean", "Trimmed Mean", "P95", "Max"],
+                                key="rt_stat")
+        _fn_map = {
+            "Median": lambda x: x.median(),
+            "Mean":   lambda x: x.mean(),
+            "Max":    lambda x: x.max(),
+            "Trimmed Mean": trimmed_mean,
+            "P95":    lambda x: x.quantile(0.95),
+        }
+        fn = _fn_map[stat_sel]
+        tmp = (
+            df.groupby(["PartNumber", "OperationNumber"])["RuntimeHours"]
+            .apply(fn).reset_index()
+        )
+        tmp.columns = ["PartNumber", "OperationNumber", "Value"]
+        tmp["Label"] = tmp["PartNumber"] + " / Op" + tmp["OperationNumber"]
+        fig5 = px.bar(tmp.sort_values("Value"),
+                      x="Value", y="Label", orientation="h",
+                      color="Value", color_continuous_scale="Purples",
+                      labels={"Value": f"{stat_sel} Runtime (h)", "Label": ""},
+                      template=THEME)
+        fig5.update_layout(height=max(280, len(tmp) * 28), margin=dict(t=5, b=5))
+        st.plotly_chart(fig5, use_container_width=True)
+
+        st.subheader("Runtime over Time")
+        fig6 = px.scatter(df.dropna(subset=["StartDT"]),
+                          x="StartDT", y="RuntimeHours", color="MachineName",
+                          hover_data=["PartNumber", "OperationNumber", "SerialNumber"],
+                          template=THEME, height=340)
+        fig6.update_layout(margin=dict(t=5, b=5))
+        st.plotly_chart(fig6, use_container_width=True)
+
+        st.subheader("Runtime Summary Table – Part × Operation")
+        st.dataframe(rt_summary, use_container_width=True, hide_index=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB: DOWNTIME ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+with t_dt:
+    dts = df["DowntimeMinutes"].fillna(0)
+
+    d1, d2, d3, d4, d5, d6 = st.columns(6)
+    kpi(d1, "Rows",               f"{len(df):,}")
+    kpi(d2, "Non-zero Downtime",  f"{(dts > 0).sum():,}")
+    kpi(d3, "Median Downtime",    fmt(dts.median()) or "—")
+    kpi(d4, "Mean Downtime",      fmt(dts.mean()) or "—")
+    kpi(d5, "Max Downtime",       fmt(dts.max()) or "—")
+    kpi(d6, "P95 Downtime",       fmt(dts.quantile(0.95)) or "—")
+
+    st.divider()
+    dt_nz = df[df["DowntimeMinutes"] > 0].copy()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Downtime Distribution (non-zero only)")
+        if not dt_nz.empty:
+            fig = px.histogram(dt_nz, x="DowntimeHours", nbins=40,
+                               color_discrete_sequence=["#f38ba8"],
+                               labels={"DowntimeHours": "Downtime (h)"},
+                               template=THEME)
+            fig.update_layout(height=300, margin=dict(t=5, b=5))
+            st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        st.subheader("Total Downtime by Machine")
+        m_dt = df.groupby("MachineName")["DowntimeHours"].sum().reset_index().sort_values("DowntimeHours")
+        fig2 = px.bar(m_dt, x="DowntimeHours", y="MachineName", orientation="h",
+                      color="DowntimeHours", color_continuous_scale="Reds", template=THEME)
+        fig2.update_layout(height=300, margin=dict(t=5, b=5))
+        st.plotly_chart(fig2, use_container_width=True)
+
+    c3, c4 = st.columns(2)
+    with c3:
+        st.subheader("Total Downtime by Part")
+        p_dt = df.groupby("PartNumber")["DowntimeHours"].sum().reset_index().sort_values("DowntimeHours")
+        fig3 = px.bar(p_dt, x="DowntimeHours", y="PartNumber", orientation="h",
+                      color="DowntimeHours", color_continuous_scale="Oranges", template=THEME)
+        fig3.update_layout(height=300, margin=dict(t=5, b=5))
+        st.plotly_chart(fig3, use_container_width=True)
+    with c4:
+        st.subheader("Downtime Box Plot by Operation")
+        fig4 = px.box(df, x="OperationNumber", y="DowntimeHours",
+                      color="OperationNumber", template=THEME)
+        fig4.update_layout(height=300, margin=dict(t=5, b=5), showlegend=False)
+        st.plotly_chart(fig4, use_container_width=True)
+
+    st.subheader("Downtime over Time")
+    fig5 = px.scatter(df.dropna(subset=["StartDT"]),
+                      x="StartDT", y="DowntimeHours", color="MachineName",
+                      hover_data=["PartNumber", "SerialNumber", "OperationNumber"],
+                      template=THEME, height=340)
+    fig5.update_layout(margin=dict(t=5, b=5))
+    st.plotly_chart(fig5, use_container_width=True)
+
+    st.subheader("Top 20 Longest Downtime Events")
+    dt_disp = ["ID", "MachineName", "PartNumber", "OperationNumber",
+               "SerialNumber", "Dt_disp", "Rt_disp", "StartDate", "StartTime"]
+    if not df.empty:
+        st.dataframe(
+            df.nlargest(20, "DowntimeMinutes")[dt_disp]
+              .rename(columns={"Dt_disp": "Downtime", "Rt_disp": "Runtime"}),
+            use_container_width=True, hide_index=True,
+        )
+
+    if not df["DowntimeMinutes"].dropna().empty and df["DowntimeMinutes"].max() > 0:
+        w = df.loc[df["DowntimeMinutes"].idxmax()]
+        st.error(
+            f"🔴 **Longest downtime:** {w['Dt_disp']}  |  Machine: {w['MachineName']}  "
+            f"|  Part: {w['PartNumber']}  |  Op: {w['OperationNumber']}  "
+            f"|  Serial: {w['SerialNumber']}  |  Started: {w['StartDate']} {w['StartTime']}"
+        )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB: BENCHMARK
+# ─────────────────────────────────────────────────────────────────────────────
+with t_bm:
+    st.subheader("Benchmark / Routing Time Comparison")
+    st.caption(
+        "**Source legend** — "
+        "*WinCC Median/Mean/Trim Mean*: calculated from current filtered+cleaned WinCC data  |  "
+        "*Operator Time*: manually entered current run data from the operator  |  "
+        "*Prod. Time*: proposed target from Production Engineering"
+    )
+
+    with st.expander("➕ Add / Edit Benchmark Row", expanded=False):
+        be1, be2, be3 = st.columns(3)
+        bm_part = be1.selectbox("Part Number", [""] + sorted(df_full["PartNumber"].unique()), key="bm_part")
+        bm_op   = be2.selectbox("Operation",   [""] + sorted(df_full["OperationNumber"].unique()), key="bm_op")
+        bm_fam  = be3.text_input("Family (optional)", key="bm_fam")
+        be4, be5, be6 = st.columns(3)
+        bm_op_t  = be4.text_input("Operator Time",            placeholder="e.g. 6:31", key="bm_opt")
+        bm_pr_t  = be5.text_input("Production Proposed Time", placeholder="e.g. 6:00", key="bm_prt")
+        bm_notes = be6.text_input("Notes", key="bm_notes")
+        if st.button("✅ Save Benchmark Row"):
+            if bm_part and bm_op:
+                cur = st.session_state.benchmarks.copy()
+                cur = cur[~((cur["PartNumber"] == bm_part) & (cur["OperationNumber"] == bm_op))]
+                new_row = pd.DataFrame([{
+                    "PartNumber": bm_part, "OperationNumber": bm_op,
+                    "Family": bm_fam,
+                    "OperatorTime_min": parse_user_time(bm_op_t),
+                    "ProductionTime_min": parse_user_time(bm_pr_t),
+                    "Notes": bm_notes,
+                }])
+                st.session_state.benchmarks = pd.concat([cur, new_row], ignore_index=True)
+                st.success(f"Saved {bm_part} / Op {bm_op}. Refresh the page to update charts.")
+            else:
+                st.warning("Select Part and Operation first.")
+
+    with st.expander("📤 Upload Benchmark CSV", expanded=False):
+        bm_up = st.file_uploader("Benchmark CSV", type="csv", key="bm_upload")
+        if bm_up:
+            try:
+                st.session_state.benchmarks = pd.read_csv(bm_up)
+                st.success("Loaded successfully.")
+            except Exception as e:
+                st.error(str(e))
+
+    st.subheader("Comparison Table")
+    if cmp_display.empty:
+        st.info("No data available. Upload a file and ensure filters return results.")
+    else:
+        st.dataframe(cmp_display, use_container_width=True, hide_index=True)
+
+        if not bm_comparison.empty and "WinCC_Median" in bm_comparison.columns:
+            st.subheader("Comparison Chart")
+            cs = bm_comparison.dropna(subset=["WinCC_Median"]).copy()
+            cs["Label"] = cs["PartNumber"] + " / Op" + cs["OperationNumber"]
+            fig_bm = go.Figure()
+            fig_bm.add_trace(go.Bar(name="WinCC Median",    x=cs["Label"], y=cs["WinCC_Median"]/60,    marker_color="#7c3aed"))
+            fig_bm.add_trace(go.Bar(name="WinCC Trim Mean", x=cs["Label"], y=cs["WinCC_TrimMean"]/60,  marker_color="#89b4fa"))
+            if cs.get("OperatorTime_min", pd.Series(dtype=float)).notna().any():
+                fig_bm.add_trace(go.Bar(name="Operator Time",       x=cs["Label"], y=cs["OperatorTime_min"]/60,    marker_color="#a6e3a1"))
+            if cs.get("ProductionTime_min", pd.Series(dtype=float)).notna().any():
+                fig_bm.add_trace(go.Bar(name="Production Proposed", x=cs["Label"], y=cs["ProductionTime_min"]/60,  marker_color="#fab387"))
+            fig_bm.update_layout(barmode="group", template=THEME, height=380,
+                                 yaxis_title="Runtime (h)", xaxis_tickangle=-40,
+                                 margin=dict(t=5, b=80))
+            st.plotly_chart(fig_bm, use_container_width=True)
+
+    bm_cur = st.session_state.benchmarks
+    if not bm_cur.empty:
+        with st.expander("🗑 Delete a Benchmark Row"):
+            labels = (bm_cur["PartNumber"] + " / Op" + bm_cur["OperationNumber"]).tolist()
+            del_lbl = st.selectbox("Row to delete", labels, key="bm_del")
+            if st.button("Delete row"):
+                p, o = del_lbl.split(" / Op")
+                st.session_state.benchmarks = bm_cur[
+                    ~((bm_cur["PartNumber"] == p) & (bm_cur["OperationNumber"] == o))
+                ].reset_index(drop=True)
+                st.success(f"Deleted {del_lbl}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB: GROUPS / FAMILIES
+# ─────────────────────────────────────────────────────────────────────────────
+with t_gr:
+    st.subheader("Part Family / Group Analysis")
+
+    with st.expander("✏️ Define Part Families", expanded=True):
+        g1, g2, g3 = st.columns([2, 4, 2])
+        fam_name  = g1.text_input("Family Name", key="fam_name")
+        fam_parts = g2.multiselect("Parts", sorted(df_full["PartNumber"].unique()), key="fam_parts")
+        if g3.button("💾 Save Family"):
+            if fam_name and fam_parts:
+                st.session_state.families[fam_name] = fam_parts
+                st.success(f"'{fam_name}' saved.")
+        if st.session_state.families:
+            fam_tbl = pd.DataFrame([
+                {"Family": k, "Parts": ", ".join(v)}
+                for k, v in st.session_state.families.items()
+            ])
+            st.dataframe(fam_tbl, use_container_width=True, hide_index=True)
+            del_f = st.selectbox("Delete family",
+                                 [""] + list(st.session_state.families.keys()),
+                                 key="del_f")
+            if st.button("🗑 Delete Family") and del_f:
+                del st.session_state.families[del_f]
+                st.success(f"Deleted '{del_f}'")
+
+    if st.session_state.families:
+        p2f = {p: fam for fam, ps in st.session_state.families.items() for p in ps}
+        df_g = df.copy()
+        df_g["Family"] = df_g["PartNumber"].map(p2f).fillna("Unassigned")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Runtime by Family")
+            fig = px.box(df_g, x="Family", y="RuntimeHours",
+                         color="Family", template=THEME)
+            fig.update_layout(height=320, showlegend=False, margin=dict(t=5, b=5))
+            st.plotly_chart(fig, use_container_width=True)
+        with c2:
+            st.subheader("Median Runtime – Family × Operation")
+            fg = df_g.groupby(["Family", "OperationNumber"])["RuntimeHours"].median().reset_index()
+            fig2 = px.bar(fg, x="RuntimeHours", y="Family", color="OperationNumber",
+                          orientation="h", barmode="group", template=THEME,
+                          labels={"RuntimeHours": "Median (h)"})
+            fig2.update_layout(height=320, margin=dict(t=5, b=5))
+            st.plotly_chart(fig2, use_container_width=True)
+
+        st.subheader("Family Summary Table")
+        fs = df_g.groupby(["Family", "OperationNumber"])["RuntimeMinutes"].agg(
+            Count="count", Median="median", Mean="mean", Min="min", Max="max"
+        ).reset_index()
+        for c in ["Median", "Mean", "Min", "Max"]:
+            fs[c] = fs[c].apply(fmt)
+        st.dataframe(fs, use_container_width=True, hide_index=True)
+    else:
+        st.info("💡 Define a family above to see group analytics.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB: PERIOD COMPARISON
+# ─────────────────────────────────────────────────────────────────────────────
+with t_pc:
+    st.subheader("Period-over-Period Comparison")
+    vd = df_full["StartDT"].dropna()
+    if vd.empty:
+        st.warning("No valid start dates in the dataset.")
+    else:
+        mn2, mx2 = vd.min().date(), vd.max().date()
+        mid = mn2 + (mx2 - mn2) // 2
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Period A**")
+            pa_f = st.date_input("From", value=mn2, key="pa_f", min_value=mn2, max_value=mx2)
+            pa_t = st.date_input("To",   value=mid, key="pa_t", min_value=mn2, max_value=mx2)
+        with c2:
+            st.markdown("**Period B**")
+            pb_f = st.date_input("From", value=mid, key="pb_f", min_value=mn2, max_value=mx2)
+            pb_t = st.date_input("To",   value=mx2, key="pb_t", min_value=mn2, max_value=mx2)
+
+        def _slice(f, t):
+            return df_full[
+                (df_full["StartDT"].dt.date >= f) &
+                (df_full["StartDT"].dt.date <= t) &
+                df_full["RuntimeMinutes"].notna() &
+                (df_full["RuntimeMinutes"] > 0)
+            ]
+
+        dfa = _slice(pa_f, pa_t)
+        dfb = _slice(pb_f, pb_t)
+
+        def _row(d, lbl):
+            r  = d["RuntimeMinutes"]
+            dw = d["DowntimeMinutes"].fillna(0)
+            return {
+                "Period": lbl,
+                "Rows": len(d),
+                "Unique Parts": d["PartNumber"].nunique(),
+                "Median Runtime":  fmt(r.median()),
+                "Mean Runtime":    fmt(r.mean()),
+                "Trim Mean":       fmt(trimmed_mean(r)),
+                "P95 Runtime":     fmt(r.quantile(0.95)) if len(r) else "—",
+                "Std Dev":         fmt(r.std()),
+                "Median Downtime": fmt(dw.median()),
+                "Max Downtime":    fmt(dw.max()),
+            }
+
+        cmp_tbl = pd.DataFrame([
+            _row(dfa, f"A  ({pa_f} → {pa_t})"),
+            _row(dfb, f"B  ({pb_f} → {pb_t})"),
+        ]).set_index("Period").T
+        st.dataframe(cmp_tbl, use_container_width=True)
+
+        if not dfa.empty and not dfb.empty:
+            ma = dfa["RuntimeMinutes"].median()
+            mb = dfb["RuntimeMinutes"].median()
+            delta = mb - ma
+            pct_d = delta / ma * 100 if ma else 0
+            st.metric("Median Runtime  A → B", fmt(mb),
+                      delta=f"{'+' if delta >= 0 else ''}{fmt(abs(delta))} ({pct_d:+.1f}%)")
+
+            dfa2 = dfa.copy(); dfa2["Period"] = "A"
+            dfb2 = dfb.copy(); dfb2["Period"] = "B"
+            ab = pd.concat([dfa2, dfb2])
+            ab_g = ab.groupby(["PartNumber", "Period"])["RuntimeHours"].median().reset_index()
+            fig_p = px.bar(ab_g, x="PartNumber", y="RuntimeHours", color="Period",
+                           barmode="group", template=THEME,
+                           labels={"RuntimeHours": "Median Runtime (h)"}, height=360)
+            fig_p.update_xaxes(tickangle=-40)
+            fig_p.update_layout(margin=dict(t=5, b=80))
+            st.plotly_chart(fig_p, use_container_width=True)
+
+            ma_g = dfa.groupby(["PartNumber", "OperationNumber"])["RuntimeMinutes"].median()
+            mb_g = dfb.groupby(["PartNumber", "OperationNumber"])["RuntimeMinutes"].median()
+            chg = pd.DataFrame({"Period A": ma_g, "Period B": mb_g}).reset_index()
+            chg["Δ"]   = chg["Period B"] - chg["Period A"]
+            chg["Δ %"] = (chg["Δ"] / chg["Period A"] * 100).round(1)
+            for c in ["Period A", "Period B", "Δ"]:
+                chg[c] = chg[c].apply(lambda x: fmt(x) if pd.notna(x) else "—")
+            chg["Δ %"] = chg["Δ %"].apply(lambda x: f"{x:+.1f}%" if pd.notna(x) else "—")
+            st.subheader("Median Runtime Change – Part × Operation")
+            st.dataframe(chg, use_container_width=True, hide_index=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB: EXPORT  (all variables already computed above – no scoping issues)
+# ─────────────────────────────────────────────────────────────────────────────
+with t_ex:
+    st.subheader("💾 Download Reports")
+
+    # ── 1. Cleaned CSV ───────────────────────────────────────────────────────
+    st.markdown("#### 1 · Cleaned Filtered Data")
+    st.download_button(
+        label="⬇️ cleaned_data.csv",
+        data=df_export.to_csv(index=False).encode("utf-8"),
+        file_name="cleaned_data.csv",
+        mime="text/csv",
+        key="dl_clean",
+    )
+    st.caption(f"{len(df_export):,} rows, {len(df_export.columns)} columns")
+
+    # ── 2. Outliers CSV ──────────────────────────────────────────────────────
+    st.markdown("#### 2 · Excluded Outlier Rows")
+    if not df_excl_exp.empty:
+        st.download_button(
+            label="⬇️ excluded_outliers.csv",
+            data=df_excl_exp.to_csv(index=False).encode("utf-8"),
+            file_name="excluded_outliers.csv",
+            mime="text/csv",
+            key="dl_excl",
+        )
+        st.caption(f"{len(df_excl_exp):,} outlier rows")
+    else:
+        st.info("No outlier rows to export (removal off, or none detected).")
+
+    # ── 3. Benchmark CSV ─────────────────────────────────────────────────────
+    st.markdown("#### 3 · Benchmark Table")
+    bm_dl = st.session_state.benchmarks.copy()
+    if not bm_dl.empty:
+        bm_dl["OperatorTime_HHMM"]   = bm_dl["OperatorTime_min"].apply(fmt)
+        bm_dl["ProductionTime_HHMM"] = bm_dl["ProductionTime_min"].apply(fmt)
+        st.download_button(
+            label="⬇️ benchmarks.csv",
+            data=bm_dl.to_csv(index=False).encode("utf-8"),
+            file_name="benchmarks.csv",
+            mime="text/csv",
+            key="dl_bm",
+        )
+    else:
+        st.info("No benchmarks entered yet.")
+
+    # ── 4. Full Excel report ─────────────────────────────────────────────────
+    st.markdown("#### 4 · Full Management Report (Excel, multi-sheet)")
+    with st.spinner("Building Excel workbook …"):
+        xl = {
+            "Filtered Data":        df_export,
+            "Excluded Outliers":    df_excl_exp,
+            "Runtime Summary":      rt_summary,
+            "Downtime Summary":     dt_summary,
+            "Machine Summary":      mach_summary,
+            "Benchmark Comparison": cmp_display,
+        }
+        if not bm_dl.empty:
+            xl["Benchmarks"] = bm_dl
+        xl_bytes = to_excel(xl)
+
+    st.download_button(
+        label="⬇️ management_report.xlsx",
+        data=xl_bytes,
+        file_name="management_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_xl",
+    )
+    sheets_built = [k for k, v in xl.items() if isinstance(v, pd.DataFrame) and not v.empty]
+    st.caption(f"Sheets included: {', '.join(sheets_built)}")
+
+    st.divider()
+    st.markdown(
+        "💡 **Print to PDF:** Use your browser's *File → Print → Save as PDF* "
+        "to capture any tab as a report."
+    )
